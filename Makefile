@@ -10,5 +10,5 @@ build:
 	gcc -std=c99 -pthread -o server server.c sel_repeat.c
 
 gdb:
-	gcc -gdb -std=c99 -pthread -o client_d client.c sel_repeat.c
-	gcc -gdb -std=c99 -pthread -o server_d server.c sel_repeat.c
+	gcc -g -std=c99 -pthread -o client_d client.c sel_repeat.c
+	gcc -g -std=c99 -pthread -o server_d server.c sel_repeat.c
