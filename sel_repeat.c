@@ -62,12 +62,14 @@ int connect_rdt(int port, char* hostname)
 
   /* Allocate connect_meta structure */
   for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++) {
-    if (meta_array[meta_i] == NULL)
+    if (meta_array[meta_i] == NULL) {
       meta_array[meta_i] = (connect_meta*)malloc(sizeof(connect_meta));
+      break;
+    }
     else if (meta_i == CONNECTION_LIMIT - 1)
       return -1;
   }
-
+  meta = meta_array[meta_i];
   /* Init metadata members */
   meta->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
   meta->serv_addr.sin_family = AF_INET;
@@ -89,8 +91,10 @@ int init_serv(int port, char* hostname)
   
   /* Allocate connect_meta structure */
   for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++) {
-    if (meta_array[meta_i] == NULL)
+    if (meta_array[meta_i] == NULL) {
       meta_array[meta_i] = (connect_meta*)malloc(sizeof(connect_meta));
+      break;
+    }
     else if (meta_i == CONNECTION_LIMIT - 1)
       return -1;
   }
@@ -156,8 +160,10 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
   /* If this is the initial SEQ packet */
   if (packet->header.SEQ && !packet->header.ACK) {
     for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++)
-      if (meta_array[meta_i] == NULL)
+      if (meta_array[meta_i] == NULL) {
         meta_array[meta_i] = malloc(sizeof(connect_meta));
+        break;
+      }
       else if (meta_i == CONNECTION_LIMIT - 1)
         return;
     meta_array[meta_i]->udp_socket = sock_fd;
