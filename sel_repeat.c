@@ -60,6 +60,9 @@ typedef struct connect_metadata {
   char buffer[BUF_SIZE];
 } connect_meta;
 
+/* Function prototypes */
+int fetch_packets(int udp_socket);
+
 connect_meta* meta_array[CONNECTION_LIMIT] = {0, 0, 0, 0, 0, 0, 0, 0};
 
 int connect_rdt(int port, char* hostname)
@@ -156,6 +159,7 @@ void* pth_send_packet(void* arg)
 
     usleep(RT_TIMEOUT*1000);
     meta = meta_array[packet_arg->meta_i];
+	fetch_packets(meta->udp_socket);
     if (meta == NULL || meta->frame_base > packet_arg->packet->header.sequence_num)
       break;
   }
@@ -174,9 +178,10 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
   h_packet* response;
   struct pth_sp_arg* pth_arg;
   pthread_t thr;
-  char hbuf[NI_MAXHOST], compare[NI_MAXHOST];
+  //char hbuf[NI_MAXHOST], compare[NI_MAXHOST];
 
-  getnameinfo((struct sockaddr*)serv_addr, sizeof(serv_addr), hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
+  //getnameinfo((struct sockaddr*)serv_addr, sizeof(serv_addr), hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
+  
 
   /* If this is the initial SEQ packet */
   if (packet->header.SEQ && !packet->header.ACK) {
@@ -214,10 +219,8 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
   /* Otherwise try to find matching sender */
   for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++) {
     if (meta_array[meta_i] != NULL) {
-      getnameinfo((struct sockaddr*) &meta_array[meta_i]->serv_addr, sizeof(meta_array[meta_i]->serv_addr), compare, 
-                  sizeof(compare), NULL, 0, NI_NUMERICHOST);
-      if (strcmp(hbuf, compare) == 0)
-        break;
+      if (serv_addr->sin_addr.s_addr == meta_array[meta_i]->serv_addr.sin_addr.s_addr)
+		  break;
     }
   }
   connect_meta* meta = meta_array[meta_i];
