@@ -12,7 +12,8 @@
 #include <pthread.h>
 #include <unistd.h>
 
-#define BUF_SIZE 16*(PACKET_LEN - sizeof(m_header))
+#define BUF_SIZE (16*(PACKET_LEN - sizeof(m_header)) + 1)
+#define DATA_LEN (PACKET_LEN - sizeof(m_header))
 #define CONNECTION_LIMIT 8
 
 typedef struct mikes_header {
@@ -36,10 +37,11 @@ typedef struct connect_metadata {
   struct sockaddr_in client_addr;
 
   /* Window variables */
-  uint16_t frame_base;
-  uint8_t  acked_bmap; // LSB = current packet, MSB = later packet
+  volatile uint16_t frame_base;
+  volatile uint8_t  acked_bmap; // LSB = current packet, MSB = later packet
 
   /* Buffer variables */
+  uint8_t  buf_complete;
   uint16_t buf_start;
   uint16_t buf_end;
   char buffer[BUF_SIZE];
@@ -51,6 +53,7 @@ int connect_rdt(int port, char* hostname)
 {
   /* Local variables */
   int meta_i;
+  connect_meta* meta;
 
   /* Allocate connect_meta structure */
   for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++) {
@@ -61,13 +64,14 @@ int connect_rdt(int port, char* hostname)
   }
 
   /* Init metadata members */
-  meta_array[meta_i]->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
-  meta_array[meta_i]->serv_addr.sin_family = AF_INET;
-  meta_array[meta_i]->serv_addr.sin_port = htons(port);
-  meta_array[meta_i]->serv_addr.sin_addr.s_addr = inet_addr(hostname);
-                    
-  meta_array[meta_i]->buf_start = 0;
-  meta_array[meta_i]->buf_end = 0;
+  meta->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+  meta->serv_addr.sin_family = AF_INET;
+  meta->serv_addr.sin_port = htons(port);
+  meta->serv_addr.sin_addr.s_addr = inet_addr(hostname);
+  
+  meta->buf_start = 0;
+  meta->buf_end = 0;
+  meta->buf_complete = 0;
 
   return meta_i;
 }
@@ -76,6 +80,7 @@ int init_serv(int port, char* hostname)
 {
   /* Local variables */
   int meta_i;
+  connect_meta* meta;
   
   /* Allocate connect_meta structure */
   for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++) {
@@ -86,12 +91,17 @@ int init_serv(int port, char* hostname)
   }
 
   /* Init metadata members */
-  meta_array[meta_i].udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
-  meta_array[meta_i].serv_addr.sin_family = AF_INET;
-  meta_array[meta_i].serv_addr.sin_port = htons(porno);
-  meta_array[meta_i].serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+  meta = meta_array[meta_i];
+  meta->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+  meta->serv_addr.sin_family = AF_INET;
+  meta->serv_addr.sin_port = htons(port);
+  meta->serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-  bind(meta_array[meta_i].upd_socket, (struct sockaddr*)meta_array[meta_i].serv_addr,
+  meta->buf_start = 0;
+  meta->buf_end = 0;
+  meta->buf_complete = 0;
+
+  bind(meta->upd_socket, (struct sockaddr*)meta->serv_addr,
        sizeof(struct sockaddr_in));
 
   return meta_i;
@@ -104,9 +114,11 @@ struct pth_sp_arg {
 
 void* pth_send_packet(void* arg)
 {
+  struct pth_sp_arg* packet_arg;
+  connect_meta* meta;
   while (1) {
-    struct pth_sp_arg* packet_arg = (struct pth_sp_arg*)arg;
-    connect_meta* meta = meta_array[pth_sp_arg->meta_i];
+    packet_arg = (struct pth_sp_arg*)arg;
+    meta = meta_array[pth_sp_arg->meta_i];
 
     sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header->length,
            0, (struct sockaddr*)&meta->serv_addr, sizeof(struct sockaddr_in));
@@ -117,15 +129,21 @@ void* pth_send_packet(void* arg)
     if (meta == NULL || meta->frame_base > pth_sp_arg->packet->sequence_num)
       break;
   }
+  /* If this is the FIN packet, delete the metadata structure */
+  if (packet_arg->packet->header.FIN) {
+    meta_array[meta_i] = NULL;
+    free(meta);
+  }
   return NULL;
 }
 
 void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
 {
   /* Local variables */
-  int meta_i;
-  h_packet response;
-  struct pth_sp_arg pth_arg;
+  int meta_i, packet_offset;
+  h_packet* response;
+  struct pth_sp_arg* pth_arg;
+  pthread_t thr;
   char hbuf[NI_MAXHOST], compare[NI_MAXHOST];
 
   getnameinfo(serv_addr, sizeof(serv_addr), hbuf, sizeof(hbuf), NULL, NULL, NI_NUMERICHOST);
@@ -145,16 +163,17 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
     meta_array[meta_i].buf_end = 0;
 
     /* ACK SYN segment */
-    response.header.sequence_num = packet->sequence_num + packet->header.length;
-    response.header.length = sizeof(m_header);
-    response.header.SEQ = 1;
-    response.header.ACK = 1;
-    response.header.FIN = 0;
+    response = malloc(sizeof(h_packet));
+    response->header.sequence_num = packet->sequence_num + packet->header.length;
+    response->header.length = sizeof(m_header);
+    response->header.SEQ = 1;
+    response->header.ACK = 1;
+    response->header.FIN = 0;
     
-    pth_arg.meta_i = meta_i;
-    pth_arg.packet = &packet;
-    pthread_t thr;
-    pthread_create(&thr, 0, pth_send_packet, &pth_arg);
+    pth_arg = malloc(sizeof(struct pth_sp_arg));
+    pth_arg->meta_i = meta_i;
+    pth_arg->packet = response;
+    pthread_create(&thr, 0, pth_send_packet, pth_arg);
     printf("Receiving packet SYN\n");
     return;
   }
@@ -170,106 +189,120 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
   }
   connect_meta* meta = meta_array[meta_i];
 
-  /* If the packet is an ACK */
-  if (packet->header.ACK) {
-    /* Send additional data packets if available */
-    while(packet->header
-
   /* If packet is out of window region */
   if (packet->header.sequence_num > meta->frame_base + WIN_SIZE - PACKET_LEN)
     return;
-  int packet_offset = (packet->header.sequence_num - meta->frame_base) / PACKET_LEN;
 
-  /* Check for buffer overflow */
-  int ovfl    = (meta->buf_end + packet->header.length - sizeof(m_header) + 
-                 packet_offset*(PACKET_LEN - sizeof(m_header))) / BUF_SIZE;
-  int new_end = (meta->buf_end + packet->header.length - sizeof(m_header) + 
-                 packet_offset*(PACKET_LEN - sizeof(m_header))) % BUF_SIZE;
-  if ((meta->buf_start > meta->buf_end &&
-       (new_end > meta->buf_start || ovfl)) ||
-      (meta->buf_end <= meta->buf_end &&
-        new_buf > meta->buf_start && ovfl))
-    return;
+  /* Number of packets ahead */
+  packet_offset = (packet->header.sequence_num - meta->frame_base) / PACKET_LEN;
 
-  /* Copy packet data into circular buffer */
-  int nbytes_1;
-  int nbytes_2;
-  int offset_1;
-  if (new_end >= packet->header.length - sizeof(m_header)) {
-    nbytes_1 = packet->header.length - sizeof(m_header);
-    nbytes_2 = 0;
-    offset_1 = new_end - packet->header.length + sizeof(m_header);
-  }
-  else {
-    nbytes_1 = packet->header.length - sizeof(m_header) - new_end;
-    nbytes_2 = new_end;
-    offset_1 = BUF_SIZE + new_end - packet->header.length + sizeof(m_header);
-  }
-  strncpy(meta->buffer + offset_1, packet->data, nbytes_1);
-  if (nbytes_2 > 0)
-    strncpy(meta->buffer + offset_2, packet->data + nbytes_1, nbytes_2);
+  /* If this is an ACK segment */
+  if (packet->header.ACK) {
+    /* New ACK */
+    if (packet->header.sequence_num > meta->frame_base) {
+      packet_offset = (packet->header.sequence_num - meta->frame_base) / PACKET_LEN;
 
-  /* Add segment to acked_bmap */
-  meta->acked_bmap |= (1 << packet_offset);
+      /* Add to acked bitmap */
+      meta->acked_bmap |= packet_offset;
 
-  /* Update buf_end for continuous data segments */
-  while (meta->acked_bmap & 1) {
-    meta->acked_bmap >>= 1;
-    if (meta->acked_bmap) {
-      meta->buf_end = (meta->buf_end + PACKET_LEN - sizeof(m_header)) % BUF_SIZE;
-      meta->frame_base += PACKET_LEN;
+      /* Update frame_base and start sending data packets */
+      while (meta->acked_bmap & 1) {
+        meta->acked_bmap >>= 1;
+        /* If there is enough data for a full packet */
+        if ((meta->buf_end - meta->buf_start) % BUF_SIZE >= DATA_LEN) {
+          /* Assemble data packet */
+          response = malloc(sizeof(h_packet));
+          response->header.sequence_num = meta->frame_base + WIN_SIZE;
+          response->header.length = PACKET_LEN;
+          response->header.SEQ = 0;
+          response->header.ACK = 0;
+          response->header.FIN = (meta->buf_complete && (meta->buf_start + DATA_LEN) % BUF_SIZE == meta->buf_end) ? 1 : 0;
+          /* Copy bytes into data segment */
+          for (int i = 0; i < DATA_LEN; i++)
+            response->data[i] = meta->buffer[(meta->buf_start + i) % BUF_SIZE];
+
+          meta->buf_start = (meta->buf_start + DATA_LEN) % BUF_SIZE;
+
+          pth_arg = malloc(sizeof(struct pth_sp_arg));
+          pth_arg->meta_i = meta_i;
+          pth_arg->packet = response;
+          pthread_create(&thr, 0, pth_send_packet, pth_arg);
+        } 
+        /* If there is a nonzero amount of data, but we are done writing to buffer */
+        else if (meta->buf_complete && meta->buf_end != meta->buf_start) {
+          response = malloc(sizeof(h_packet));
+          response->header.sequence_num = meta->frame_base + WIN_SIZE;
+          response->header.length = (meta->buf_end - meta->buf_start) % BUF_SIZE;
+          response->header.SEQ = 0;
+          response->header.ACK = 0;
+          response->header.FIN = 1;
+          /* Copy bytes into data segment */
+          for (int i = 0; i < response->header.length; i++)
+            response->data[i] = meta->buffer[(meta->buf_start + i) % BUF_SIZE];
+
+          meta->buf_start = meta->buf_end;
+
+          pth_arg = malloc(sizeof(struct pth_sp_arg));
+          pth_arg->meta_i = meta_i;
+          pth_arg->packet = response;
+          pthread_create(&thr, 0, pth_send_packet, pth_arg);
+        }
+        /* Increment the frame_base */
+        meta->frame_base += PACKET_LEN;
+      }
     }
-    else {
-      meta->buf_end = (meta->buf_end + packet->header.length - sizeof(m_header)) % BUF_SIZE;
-      meta->frame_base += packet->header.length;
-    }
   }
-  
-  /* Send cumulative ACK */
-  response.header.sequence_num = meta->frame_base;
-  response.header.length = sizeof(m_header);
-  response.header.SEQ = 0;
-  response.header.ACK = 1;
-  response.header.FIN = 0;
+
+  /* If this is a data packet */
+  else {   
+    /* Copy packet data into circular buffer */
+    for (int i = 0; i < packet->header.length; i++) {
+      /* If the buffer is too small for the data */
+      if ((meta->buf_end + i + 1) % BUF_SIZE == meta->buf_start)
+        return;
+      meta->buffer[(buf_end + i) % BUF_SIZE] = packet->data[i];
+    }
+    meta->buf_end += packet->header.length;
+    meta->buf_end %= BUF_SIZE;
+ 
+    /* Mark buffer complete if this is a FIN packet */
+    if (packet->header.FIN)
+      meta->buffer_complete = 1;
+
+    /* Add segment to acked_bmap */
+    meta->acked_bmap |= (1 << packet_offset);
+   
+    /* Update buf_end for continuous data segments */
+    while (meta->acked_bmap & 1) {
+      meta->acked_bmap >>= 1;
+      if (meta->acked_bmap) {
+        meta->buf_end = (meta->buf_end + PACKET_LEN - sizeof(m_header)) % BUF_SIZE;
+        meta->frame_base += PACKET_LEN;
+      }
+      else {
+        meta->buf_end = (meta->buf_end + packet->header.length - sizeof(m_header)) % BUF_SIZE;
+        meta->frame_base += packet->header.length;
+      }
+    }
+
+    /* Send individual ACK */
+    response = malloc(sizeof(h_packet));
+    response.header.sequence_num = packet->header.sequence_num;
+    response.header.length = sizeof(m_header);
+    response.header.SEQ = 0;
+    response.header.ACK = 1;
+    response.header.FIN = (packet->header.FIN);
+
+    pth_arg = malloc(sizeof(struct pth_sp_arg));
+    pth_arg->meta_i = meta_i;
+    pth_arg->packet = response;
+    pthread_create(&thr, 0, pth_send_packet, pth_arg);
+  }
   return;
 }
 
-void* send_data(int meta_i, char* send_buf, int nbytes)
+int fetch_packets(int udp_socket)
 {
-  /* Local variables */
-  int byte_offset;
-  connect_meta* meta = meta_array[meta_i];
-  struct sockaddr_storage serv_storage;
-  storage_size = sizeof(serv_storage);
-
-  /* Send SYN segment */
-  h_packet packet;
-  packet.header.sequence_num = -1;
-  packet.header.length = sizeof(m_header);
-  packet.header.SEQ = 1;
-  packet.header.ACK = 0;
-  packet.header.FIN = 0;
-
-  struct pth_sp_arg pth_arg;
-  pth_arg.meta_i = meta_i;
-  pth_arg.packet = &packet;
-
-
-  pthread_t thr;
-  pthread_create(&th, 0, pth_send_packet, &pth_arg);
-  int nbytes;
+  char buf[PACKET_LEN];
   while (1) {
-    nbytes = recvfrom(meta->udp_socket, packet, PACKET_LEN, 0, 
-                   (struct sockaddr*)serv_storage, &storage_size);
-    if (nbytes > 0) {
-      if (packet.header.SEQ && packet.header.ACK && packet.header.sequence_num == -1) {
-        meta->frame_base = 0;
-        break;
-      }
-    }
-    
-  
-
-  while(byte_offset < nbytes) {
-    if (meta_array[meta_i].
-
+    recvfrom(int 
