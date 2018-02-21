@@ -5,6 +5,8 @@
 /* File:    sel_repeat.c        */
 /********************************/
 
+#define _BSD_SOURCE
+
 #include "sel_repeat.h"
 #include <stdint.h>
 #include <stdlib.h>
@@ -127,7 +129,7 @@ struct pth_sp_arg {
   h_packet* packet;
 };
 
-inline struct pth_sp_arg* make_pack_arg(int meta_i, int sequence, int length, int SEQ, int FIN, int ACK)
+struct pth_sp_arg* make_pack_arg(int meta_i, int sequence, int length, int SEQ, int FIN, int ACK)
 {
   struct pth_sp_arg* pack_arg = malloc(sizeof(struct pth_sp_arg));
   h_packet* packet = malloc(sizeof(h_packet));
@@ -152,7 +154,7 @@ void* pth_send_packet(void* arg)
            0, (struct sockaddr*)&meta->serv_addr, sizeof(struct sockaddr_in));
     printf("Sending packet %d %d\n", packet_arg->packet->header.sequence_num, WIN_SIZE);
 
-    nanosleep(RT_TIMEOUT*1000000);
+    usleep(RT_TIMEOUT*1000);
     meta = meta_array[packet_arg->meta_i];
     if (meta == NULL || meta->frame_base > packet_arg->packet->header.sequence_num)
       break;
