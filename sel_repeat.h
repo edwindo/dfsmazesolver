@@ -5,9 +5,17 @@
 /* File:    sel_repeat.h        */
 /********************************/
 
+#ifndef SEL_REPEAT_H
+#define SEL_REPEAT_H
+
 #define PACK_LEN    1024
 #define MAX_SEQ_NUM 30720
 #define WIN_SIZE    5120
 #define RT_TIMEOUT  500
 
+int init_serv(int port, char* hostname);
 int connect_rdt(int port, char* hostname);
+int read_sr(int meta_i, void *buf, size_t nbyte);
+int write_sr(int meta_i, void *buf, size_t count);
+
+#endif
