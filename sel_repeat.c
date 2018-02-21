@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <string.h>
+#include <time.h>
 
 #define BUF_SIZE (16*(PACK_LEN - sizeof(m_header)) + 1)
 #define DATA_LEN (PACK_LEN - sizeof(m_header))
@@ -129,7 +130,7 @@ void* pth_send_packet(void* arg)
            0, (struct sockaddr*)&meta->serv_addr, sizeof(struct sockaddr_in));
     printf("Sending packet %d %d\n", packet_arg->packet->header.sequence_num, WIN_SIZE);
 
-    usleep(RT_TIMEOUT*1000);
+    nanosleep(RT_TIMEOUT*1000000);
     meta = meta_array[packet_arg->meta_i];
     if (meta == NULL || meta->frame_base > packet_arg->packet->header.sequence_num)
       break;
