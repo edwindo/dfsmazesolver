@@ -323,6 +323,10 @@ int read_sr(int meta_i, void *buf, size_t nbyte)
 
   length = (end - start) % BUF_SIZE;
 
+  if (length == 0 && meta->buffer_complete) {
+    return -1;
+  }
+
   int bytes_read = 0;
 
   for (int i = 0; i < nbyte; i++) {
@@ -359,4 +363,10 @@ int write_sr(int meta_i, void *buf, size_t count)
   }
   meta->buf_end = (end + bytes_written) % BUF_SIZE;
   return bytes_written;
+}
+
+void mark_done(int meta_i)
+{
+  meta = meta_array[meta_i];
+  meta->buffer_complete = 1;
 }
