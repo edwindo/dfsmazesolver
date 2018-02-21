@@ -137,7 +137,7 @@ void* pth_send_packet(void* arg)
   return NULL;
 }
 
-void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
+void route_packet(h_packet* packet, struct sockaddr_storage* serv_addr, int sock_fd)
 {
   /* Local variables */
   int meta_i, packet_offset;
@@ -304,5 +304,11 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
 int fetch_packets(int udp_socket)
 {
   char buf[PACKET_LEN];
+  struct sockaddr_in src_addr;
+  socklen_t length = sizeof(struct sockaddr_in);
   while (1) {
-    recvfrom(int 
+    if(recvfrom(udp_socket, buf, PACKET_LEN, MSG_DONTWAIT, &src_addr, &length) < 0)
+      return -1;
+    route_packet((h_packet*)buf, &src_addr, udp_socket);
+  }
+}
