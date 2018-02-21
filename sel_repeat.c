@@ -15,6 +15,7 @@
 #include <netdb.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <string.h>
 
 #define BUF_SIZE (16*(PACK_LEN - sizeof(m_header)) + 1)
 #define DATA_LEN (PACK_LEN - sizeof(m_header))
@@ -22,7 +23,7 @@
 
 typedef struct mikes_header {
   int16_t sequence_num;
-  uint8_t length;
+  uint16_t length;
   uint8_t SEQ : 1;
   uint8_t FIN : 1;
   uint8_t ACK : 1;
@@ -126,11 +127,11 @@ void* pth_send_packet(void* arg)
 
     sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header.length,
            0, (struct sockaddr*)&meta->serv_addr, sizeof(struct sockaddr_in));
-    printf("Sending packet %d %d\n", packet_arg->packet->sequence_num, WIN_SIZE);
+    printf("Sending packet %d %d\n", packet_arg->packet->header.sequence_num, WIN_SIZE);
 
     usleep(RT_TIMEOUT*1000);
     meta = meta_array[packet_arg->meta_i];
-    if (meta == NULL || meta->frame_base > packet_arg->packet->sequence_num)
+    if (meta == NULL || meta->frame_base > packet_arg->packet->header.sequence_num)
       break;
   }
   /* If this is the FIN packet, delete the metadata structure */
@@ -150,7 +151,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
   pthread_t thr;
   char hbuf[NI_MAXHOST], compare[NI_MAXHOST];
 
-  getnameinfo((struct sockaddr*)serv_addr, sizeof(serv_addr), hbuf, sizeof(hbuf), NULL, NULL, NI_NUMERICHOST);
+  getnameinfo((struct sockaddr*)serv_addr, sizeof(serv_addr), hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
 
   /* If this is the initial SEQ packet */
   if (packet->header.SEQ && !packet->header.ACK) {
@@ -185,8 +186,8 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
   /* Otherwise try to find matching sender */
   for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++) {
     if (meta_array[meta_i] != NULL) {
-      getnameinfo(meta_array[meta_i]->serv_addr, sizeof(meta_array[meta_i]->serv_addr), compare, 
-                  sizeof(compare), NULL, NULL, NI_NUMERICHOST);
+      getnameinfo((struct sockaddr*) &meta_array[meta_i]->serv_addr, sizeof(meta_array[meta_i]->serv_addr), compare, 
+                  sizeof(compare), NULL, 0, NI_NUMERICHOST);
       if (strcmp(hbuf, compare) == 0)
         break;
     }
@@ -217,7 +218,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
           /* Assemble data packet */
           response = malloc(sizeof(h_packet));
           response->header.sequence_num = meta->frame_base + WIN_SIZE;
-          response->header.length = PACKET_LEN;
+          response->header.length = PACK_LEN;
           response->header.SEQ = 0;
           response->header.ACK = 0;
           response->header.FIN = (meta->buf_complete && (meta->buf_start + DATA_LEN) % BUF_SIZE == meta->buf_end) ? 1 : 0;
@@ -252,7 +253,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
           pthread_create(&thr, 0, pth_send_packet, pth_arg);
         }
         /* Increment the frame_base */
-        meta->frame_base += PACKET_LEN;
+        meta->frame_base += PACK_LEN;
       }
     }
   }
@@ -264,14 +265,14 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
       /* If the buffer is too small for the data */
       if ((meta->buf_end + i + 1) % BUF_SIZE == meta->buf_start)
         return;
-      meta->buffer[(buf_end + i) % BUF_SIZE] = packet->data[i];
+      meta->buffer[(meta->buf_end + i) % BUF_SIZE] = packet->data[i];
     }
     meta->buf_end += packet->header.length;
     meta->buf_end %= BUF_SIZE;
  
     /* Mark buffer complete if this is a FIN packet */
     if (packet->header.FIN)
-      meta->buffer_complete = 1;
+      meta->buf_complete = 1;
 
     /* Add segment to acked_bmap */
     meta->acked_bmap |= (1 << packet_offset);
@@ -280,8 +281,8 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
     while (meta->acked_bmap & 1) {
       meta->acked_bmap >>= 1;
       if (meta->acked_bmap) {
-        meta->buf_end = (meta->buf_end + PACKET_LEN - sizeof(m_header)) % BUF_SIZE;
-        meta->frame_base += PACKET_LEN;
+        meta->buf_end = (meta->buf_end + PACK_LEN - sizeof(m_header)) % BUF_SIZE;
+        meta->frame_base += PACK_LEN;
       }
       else {
         meta->buf_end = (meta->buf_end + packet->header.length - sizeof(m_header)) % BUF_SIZE;
@@ -291,11 +292,11 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
 
     /* Send individual ACK */
     response = malloc(sizeof(h_packet));
-    response.header.sequence_num = packet->header.sequence_num;
-    response.header.length = sizeof(m_header);
-    response.header.SEQ = 0;
-    response.header.ACK = 1;
-    response.header.FIN = (packet->header.FIN);
+    response->header.sequence_num = packet->header.sequence_num;
+    response->header.length = sizeof(m_header);
+    response->header.SEQ = 0;
+    response->header.ACK = 1;
+    response->header.FIN = (packet->header.FIN);
 
     pth_arg = malloc(sizeof(struct pth_sp_arg));
     pth_arg->meta_i = meta_i;
@@ -307,27 +308,27 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
 
 int fetch_packets(int udp_socket)
 {
-  char buf[PACKET_LEN];
+  char buf[PACK_LEN];
   struct sockaddr_in src_addr;
   socklen_t length = sizeof(struct sockaddr_in);
   while (1) {
-    if(recvfrom(udp_socket, buf, PACKET_LEN, MSG_DONTWAIT, (struct sockaddr*)&src_addr, &length) < 0)
+    if(recvfrom(udp_socket, buf, PACK_LEN, MSG_DONTWAIT, (struct sockaddr*)&src_addr, &length) < 0)
       return -1;
     route_packet((h_packet*)buf, &src_addr, udp_socket);
   }
 }
 
-int read_sr(int meta_i, void *buf, size_t nbyte) 
+int read_sr(int meta_i, void *buf, unsigned int nbyte) 
 {
-  meta = meta_array[meta_i];
+  connect_meta* meta = meta_array[meta_i];
   fetch_packets(meta->udp_socket);
-  start = meta->buf_start;
-  end = meta->buf_end;
-  m_buffer = meta->m_buffer;
+  uint16_t start = meta->buf_start;
+  uint16_t end = meta->buf_end;
+  char* m_buffer = meta->buffer;
+  char* c_buf = (char*)buf;
+  int length = (end - start) % BUF_SIZE;
 
-  length = (end - start) % BUF_SIZE;
-
-  if (length == 0 && meta->buffer_complete) {
+  if (length == 0 && meta->buf_complete) {
     return -1;
   }
 
@@ -337,7 +338,7 @@ int read_sr(int meta_i, void *buf, size_t nbyte)
     if (i == length) {
       break;
     }
-    buf[i] = m_buffer[(start+i)%BUF_SIZE];
+    c_buf[i] = m_buffer[(start+i)%BUF_SIZE];
     bytes_read++;
   }
 
@@ -347,22 +348,23 @@ int read_sr(int meta_i, void *buf, size_t nbyte)
 
 }
 
-int write_sr(int meta_i, void *buf, size_t count)
+int write_sr(int meta_i, void *buf, unsigned int count)
 {
-  meta = meta_array[meta_i];
+  connect_meta* meta = meta_array[meta_i];
   fetch_packets(meta->udp_socket);
-  start = meta->buff_start;
-  end = meta->buff_end;
-  m_buffer = meta->buffer;
+  uint16_t start = meta->buf_start;
+  uint16_t end = meta->buf_end;
+  char* m_buffer = meta->buffer;
+  char* c_buf = (char*)buf;
 
   int bytes_written = 0;
 
   for (int i = 0; i < count; i++) {
-    curr_byte = (end + i) % BUF_SIZE;
+    int curr_byte = (end + i) % BUF_SIZE;
     if (curr_byte == start) {
       break;
     }
-    m_buffer[curr_byte] = buf[i];
+    m_buffer[curr_byte] = c_buf[i];
     bytes_written++;
   }
   meta->buf_end = (end + bytes_written) % BUF_SIZE;
@@ -371,6 +373,6 @@ int write_sr(int meta_i, void *buf, size_t count)
 
 void mark_done(int meta_i)
 {
-  meta = meta_array[meta_i];
-  meta->buffer_complete = 1;
+  connect_meta* meta = meta_array[meta_i];
+  meta->buf_complete = 1;
 }

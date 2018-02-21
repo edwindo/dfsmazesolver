@@ -17,5 +17,6 @@ int init_serv(int port, char* hostname);
 int connect_rdt(int port, char* hostname);
 int read_sr(int meta_i, void *buf, unsigned int nbyte);
 int write_sr(int meta_i, void *buf, unsigned int count);
+void mark_done(int meta_i);
 
 #endif
