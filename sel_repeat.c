@@ -312,3 +312,51 @@ int fetch_packets(int udp_socket)
     route_packet((h_packet*)buf, &src_addr, udp_socket);
   }
 }
+
+int read_sr(int meta_i, void *buf, size_t nbyte) 
+{
+  meta = meta_array[meta_i];
+  fetch_packets(meta->udp_socket);
+  start = meta->buf_start;
+  end = meta->buf_end;
+  m_buffer = meta->m_buffer;
+
+  length = (end - start) % BUF_SIZE;
+
+  int bytes_read = 0;
+
+  for (int i = 0; i < nbyte; i++) {
+    if (i == length) {
+      break;
+    }
+    buf[i] = m_buffer[(start+i)%BUF_SIZE];
+    bytes_read++;
+  }
+
+  meta->buf_start = (start + bytes_read) % BUF_SIZE;
+
+  return bytes_read;
+
+}
+
+int write_sr(int meta_i, void *buf, size_t count)
+{
+  meta = meta_array[meta_i];
+  fetch_packets(meta->udp_socket);
+  start = meta->buff_start;
+  end = meta->buff_end;
+  m_buffer = meta->buffer;
+
+  int bytes_written = 0;
+
+  for (int i = 0; i < count; i++) {
+    curr_byte = (end + i) % BUF_SIZE;
+    if (curr_byte == start) {
+      break;
+    }
+    m_buffer[curr_byte] = buf[i];
+    bytes_written++;
+  }
+  meta->buf_end = (end + bytes_written) % BUF_SIZE;
+  return bytes_written;
+}
