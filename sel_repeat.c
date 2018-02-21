@@ -7,13 +7,17 @@
 
 #include "sel_repeat.h"
 #include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <unistd.h>
 
-#define BUF_SIZE (16*(PACKET_LEN - sizeof(m_header)) + 1)
-#define DATA_LEN (PACKET_LEN - sizeof(m_header))
+#define BUF_SIZE (16*(PACK_LEN - sizeof(m_header)) + 1)
+#define DATA_LEN (PACK_LEN - sizeof(m_header))
 #define CONNECTION_LIMIT 8
 
 typedef struct mikes_header {
@@ -27,7 +31,7 @@ typedef struct mikes_header {
 
 typedef struct header_packet {
   m_header header;
-  uint8_t data[PACKET_LEN - sizeof(m_header)];
+  uint8_t data[PACK_LEN - sizeof(m_header)];
 } h_packet;
 
 typedef struct connect_metadata {
@@ -84,7 +88,7 @@ int init_serv(int port, char* hostname)
   
   /* Allocate connect_meta structure */
   for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++) {
-    if (meta_array[meta_i] == NULL);
+    if (meta_array[meta_i] == NULL)
       meta_array[meta_i] = (connect_meta*)malloc(sizeof(connect_meta));
     else if (meta_i == CONNECTION_LIMIT - 1)
       return -1;
@@ -101,7 +105,7 @@ int init_serv(int port, char* hostname)
   meta->buf_end = 0;
   meta->buf_complete = 0;
 
-  bind(meta->upd_socket, (struct sockaddr*)meta->serv_addr,
+  bind(meta->udp_socket, (struct sockaddr*)&meta->serv_addr,
        sizeof(struct sockaddr_in));
 
   return meta_i;
@@ -118,26 +122,26 @@ void* pth_send_packet(void* arg)
   connect_meta* meta;
   while (1) {
     packet_arg = (struct pth_sp_arg*)arg;
-    meta = meta_array[pth_sp_arg->meta_i];
+    meta = meta_array[packet_arg->meta_i];
 
-    sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header->length,
+    sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header.length,
            0, (struct sockaddr*)&meta->serv_addr, sizeof(struct sockaddr_in));
-    printf("Sending packet %d %d\n", pth_sp_arg->packet->sequence_num, WIN_SIZE);
+    printf("Sending packet %d %d\n", packet_arg->packet->sequence_num, WIN_SIZE);
 
     usleep(RT_TIMEOUT*1000);
-    meta = meta_array[pth_sp_arg->meta_i];
-    if (meta == NULL || meta->frame_base > pth_sp_arg->packet->sequence_num)
+    meta = meta_array[packet_arg->meta_i];
+    if (meta == NULL || meta->frame_base > packet_arg->packet->sequence_num)
       break;
   }
   /* If this is the FIN packet, delete the metadata structure */
   if (packet_arg->packet->header.FIN) {
-    meta_array[meta_i] = NULL;
+    meta_array[packet_arg->meta_i] = NULL;
     free(meta);
   }
   return NULL;
 }
 
-void route_packet(h_packet* packet, struct sockaddr_storage* serv_addr, int sock_fd)
+void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
 {
   /* Local variables */
   int meta_i, packet_offset;
@@ -146,25 +150,25 @@ void route_packet(h_packet* packet, struct sockaddr_storage* serv_addr, int sock
   pthread_t thr;
   char hbuf[NI_MAXHOST], compare[NI_MAXHOST];
 
-  getnameinfo(serv_addr, sizeof(serv_addr), hbuf, sizeof(hbuf), NULL, NULL, NI_NUMERICHOST);
+  getnameinfo((struct sockaddr*)serv_addr, sizeof(serv_addr), hbuf, sizeof(hbuf), NULL, NULL, NI_NUMERICHOST);
 
   /* If this is the initial SEQ packet */
   if (packet->header.SEQ && !packet->header.ACK) {
     for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++)
       if (meta_array[meta_i] == NULL)
-        meta_array[meta_i] = malloc(sizeof(connection_meta));
+        meta_array[meta_i] = malloc(sizeof(connect_meta));
       else if (meta_i == CONNECTION_LIMIT - 1)
         return;
-    meta_array[meta_i].udp_socket = sock_fd;
-    meta_array[meta_i].serv_addr = *serv_addr;
-    meta_array[meta_i].frame_base = packet->header.sequence_num + packet->header.length;
-    meta_array[meta_i].acked_bmap = 0;
-    meta_array[meta_i].buf_start = 0;
-    meta_array[meta_i].buf_end = 0;
+    meta_array[meta_i]->udp_socket = sock_fd;
+    meta_array[meta_i]->serv_addr = *serv_addr;
+    meta_array[meta_i]->frame_base = packet->header.sequence_num + packet->header.length;
+    meta_array[meta_i]->acked_bmap = 0;
+    meta_array[meta_i]->buf_start = 0;
+    meta_array[meta_i]->buf_end = 0;
 
     /* ACK SYN segment */
     response = malloc(sizeof(h_packet));
-    response->header.sequence_num = packet->sequence_num + packet->header.length;
+    response->header.sequence_num = packet->header.sequence_num + packet->header.length;
     response->header.length = sizeof(m_header);
     response->header.SEQ = 1;
     response->header.ACK = 1;
@@ -181,7 +185,7 @@ void route_packet(h_packet* packet, struct sockaddr_storage* serv_addr, int sock
   /* Otherwise try to find matching sender */
   for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++) {
     if (meta_array[meta_i] != NULL) {
-      getnameinfo(meta_array[meta_i].serv_addr, sizeof(meta_array[meta_i].serv_addr), compare, 
+      getnameinfo(meta_array[meta_i]->serv_addr, sizeof(meta_array[meta_i]->serv_addr), compare, 
                   sizeof(compare), NULL, NULL, NI_NUMERICHOST);
       if (strcmp(hbuf, compare) == 0)
         break;
@@ -190,17 +194,17 @@ void route_packet(h_packet* packet, struct sockaddr_storage* serv_addr, int sock
   connect_meta* meta = meta_array[meta_i];
 
   /* If packet is out of window region */
-  if (packet->header.sequence_num > meta->frame_base + WIN_SIZE - PACKET_LEN)
+  if (packet->header.sequence_num > meta->frame_base + WIN_SIZE - PACK_LEN)
     return;
 
   /* Number of packets ahead */
-  packet_offset = (packet->header.sequence_num - meta->frame_base) / PACKET_LEN;
+  packet_offset = (packet->header.sequence_num - meta->frame_base) / PACK_LEN;
 
   /* If this is an ACK segment */
   if (packet->header.ACK) {
     /* New ACK */
     if (packet->header.sequence_num > meta->frame_base) {
-      packet_offset = (packet->header.sequence_num - meta->frame_base) / PACKET_LEN;
+      packet_offset = (packet->header.sequence_num - meta->frame_base) / PACK_LEN;
 
       /* Add to acked bitmap */
       meta->acked_bmap |= packet_offset;
@@ -307,7 +311,7 @@ int fetch_packets(int udp_socket)
   struct sockaddr_in src_addr;
   socklen_t length = sizeof(struct sockaddr_in);
   while (1) {
-    if(recvfrom(udp_socket, buf, PACKET_LEN, MSG_DONTWAIT, &src_addr, &length) < 0)
+    if(recvfrom(udp_socket, buf, PACKET_LEN, MSG_DONTWAIT, (struct sockaddr*)&src_addr, &length) < 0)
       return -1;
     route_packet((h_packet*)buf, &src_addr, udp_socket);
   }

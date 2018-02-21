@@ -6,6 +6,7 @@
 /********************************/
 
 #include <stdio.h>
+#include <stdlib.h>
 #include "sel_repeat.h"
 
 int main(int argc, int argv[]) {
