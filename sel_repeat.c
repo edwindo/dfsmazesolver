@@ -5,6 +5,7 @@
 /* File:    sel_repeat.c        */
 /********************************/
 
+/* Needed for usleep*/
 #define _BSD_SOURCE
 
 #include "sel_repeat.h"
@@ -23,6 +24,7 @@
 #define BUF_SIZE (16*(PACK_LEN - sizeof(m_header)) + 1)
 #define DATA_LEN (PACK_LEN - sizeof(m_header))
 #define CONNECTION_LIMIT 8
+#define THREAD_LIMIT 20
 
 /* Buffer definitions */
 #define PRE_SEQ  0
@@ -46,8 +48,7 @@ typedef struct header_packet {
 typedef struct connect_metadata {
   /* Socket variables */
   int udp_socket;
-  struct sockaddr_in serv_addr;
-  struct sockaddr_in client_addr;
+  struct sockaddr_in send_addr;
 
   /* Window variables */
   volatile uint16_t frame_base;
@@ -60,7 +61,22 @@ typedef struct connect_metadata {
   char buffer[BUF_SIZE];
 } connect_meta;
 
+/* Function prototypes */
+int connect_rdt(int port, char* hostname);
+int init_serv(int port, char* hostname);
+struct pth_sp_arg* make_pack_arg(int meta_i, int sequence, int length, int SEQ, int FIN, int ACK);
+void* pth_send_packet(void* arg);
+void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd);
+int fetch_packets(int udp_socket);
+int read_sr(int meta_i, void *buf, unsigned int nbyte);
+int write_sr(int meta_i, void *buf, unsigned int count);
+void mark_done(int meta_i);
+int note_thread_id(pthread_t thr);
+
+/* Global variables */
 connect_meta* meta_array[CONNECTION_LIMIT] = {0, 0, 0, 0, 0, 0, 0, 0};
+pthread_t thread_id_array[THREAD_LIMIT];
+uint32_t thread_bitmap = 0;
 
 int connect_rdt(int port, char* hostname)
 {
@@ -80,9 +96,9 @@ int connect_rdt(int port, char* hostname)
   meta = meta_array[meta_i];
   /* Init metadata members */
   meta->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
-  meta->serv_addr.sin_family = AF_INET;
-  meta->serv_addr.sin_port = htons(port);
-  meta->serv_addr.sin_addr.s_addr = inet_addr(hostname);
+  meta->send_addr.sin_family = AF_INET;
+  meta->send_addr.sin_port = htons(port);
+  meta->send_addr.sin_addr.s_addr = inet_addr(hostname);
   
   meta->buf_start = 0;
   meta->buf_end = 0;
@@ -110,15 +126,15 @@ int init_serv(int port, char* hostname)
   /* Init metadata members */
   meta = meta_array[meta_i];
   meta->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
-  meta->serv_addr.sin_family = AF_INET;
-  meta->serv_addr.sin_port = htons(port);
-  meta->serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+  meta->send_addr.sin_family = AF_INET;
+  meta->send_addr.sin_port = htons(port);
+  meta->send_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
   meta->buf_start = 0;
   meta->buf_end = 0;
   meta->buf_complete = PRE_SEQ;
 
-  bind(meta->udp_socket, (struct sockaddr*)&meta->serv_addr,
+  bind(meta->udp_socket, (struct sockaddr*)&meta->send_addr,
        sizeof(struct sockaddr_in));
 
   return meta_i;
@@ -151,7 +167,7 @@ void* pth_send_packet(void* arg)
     meta = meta_array[packet_arg->meta_i];
 
     sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header.length,
-           0, (struct sockaddr*)&meta->serv_addr, sizeof(struct sockaddr_in));
+           0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
     printf("Sending packet %d %d\n", packet_arg->packet->header.sequence_num, WIN_SIZE);
 
     usleep(RT_TIMEOUT*1000);
@@ -164,10 +180,11 @@ void* pth_send_packet(void* arg)
     meta_array[packet_arg->meta_i] = NULL;
     free(meta);
   }
+  remove_thread_id(pthread_self());
   return NULL;
 }
 
-void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
+void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 {
   /* Local variables */
   int meta_i, packet_offset;
@@ -176,7 +193,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
   pthread_t thr;
   char hbuf[NI_MAXHOST], compare[NI_MAXHOST];
 
-  getnameinfo((struct sockaddr*)serv_addr, sizeof(serv_addr), hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
+  getnameinfo((struct sockaddr*)send_addr, sizeof(send_addr), hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
 
   /* If this is the initial SEQ packet */
   if (packet->header.SEQ && !packet->header.ACK) {
@@ -188,7 +205,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
       else if (meta_i == CONNECTION_LIMIT - 1)
         return;
     meta_array[meta_i]->udp_socket = sock_fd;
-    meta_array[meta_i]->serv_addr = *serv_addr;
+    meta_array[meta_i]->send_addr = *send_addr;
     meta_array[meta_i]->frame_base = packet->header.sequence_num + packet->header.length;
     meta_array[meta_i]->acked_bmap = 0;
     meta_array[meta_i]->buf_start = 0;
@@ -214,7 +231,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* serv_addr, int sock_fd)
   /* Otherwise try to find matching sender */
   for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++) {
     if (meta_array[meta_i] != NULL) {
-      getnameinfo((struct sockaddr*) &meta_array[meta_i]->serv_addr, sizeof(meta_array[meta_i]->serv_addr), compare, 
+      getnameinfo((struct sockaddr*) &meta_array[meta_i]->send_addr, sizeof(meta_array[meta_i]->send_addr), compare, 
                   sizeof(compare), NULL, 0, NI_NUMERICHOST);
       if (strcmp(hbuf, compare) == 0)
         break;
@@ -399,4 +416,33 @@ void mark_done(int meta_i)
 	pthread_create(&thr, 0, pth_send_packet, pack_arg);
   }
   meta->buf_complete = COMPLETE;
+}
+
+int note_thread_id(pthread_t thr)
+{
+  uint32_t mask = 1;
+  for (int i = 0; i < THREAD_LIMIT; i++) {
+    if (thread_bitmap & mask == 0) {
+      thread_id_array[i] = thr;
+      thread_bitmap |= mask;
+      return i;
+    } else
+      mask <<= 1;
+  }
+  return -1;
+}
+  
+
+int remove_thread_id(pthread_t thr)
+{
+  uint32_t mask = 1;
+  for (int i = 0; i < THREAD_LIMIT; i++) {
+    if ((thread_id_array[i] == thr) && (thread_bitmap & mask > 0)) {
+      thread_bitmap &= ~mask;
+      return i;
+    }
+    else
+      mask <<= 1;
+  }
+  return -1;
 }
