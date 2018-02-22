@@ -4,7 +4,7 @@
 # Date:    02/18/2018          #
 # File:    Makefile            #
 ################################
-
+.SILENT:
 build:
 	gcc -std=c99 -pthread -o client client.c sel_repeat.c
 	gcc -std=c99 -pthread -o server server.c sel_repeat.c
@@ -12,3 +12,6 @@ build:
 gdb:
 	gcc -g -std=c99 -pthread -o client_d client.c sel_repeat.c
 	gcc -g -std=c99 -pthread -o server_d server.c sel_repeat.c
+
+clean:
+	rm server client
