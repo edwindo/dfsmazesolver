@@ -22,4 +22,5 @@ int main(int argc, char* argv[]) {
   int meta_i = connect_rdt(port, "127.0.0.1");
   write_sr(meta_i, "THIS IS A TEST", 15);
   mark_done(meta_i);
+  sleep(3);
 }
