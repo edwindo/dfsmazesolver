@@ -22,7 +22,6 @@ int main(int argc, char* argv[]) {
   int meta_i = init_serv(port, "");
   char buf[256];
   int nbyte;
-  printf("LISTENING ON META PORT%s\n", meta_i);
   while((nbyte = read_sr(meta_i, buf, 256)) >= 0) {
     write(1, buf, nbyte);
   }

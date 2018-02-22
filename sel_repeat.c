@@ -480,7 +480,7 @@ int note_thread_id(pthread_t thr)
 {
   uint32_t mask = 1;
   for (int i = 0; i < THREAD_LIMIT; i++) {
-    if (thread_bitmap & mask == 0) {
+    if ((thread_bitmap & mask) == 0) {
       thread_id_array[i] = thr;
       thread_bitmap |= mask;
       return i;
@@ -495,7 +495,7 @@ int remove_thread_id(pthread_t thr)
 {
   uint32_t mask = 1;
   for (int i = 0; i < THREAD_LIMIT; i++) {
-    if ((thread_id_array[i] == thr) && (thread_bitmap & mask > 0)) {
+    if ((thread_id_array[i] == thr) && ((thread_bitmap & mask) > 0)) {
       thread_bitmap &= ~mask;
       return i;
     }
