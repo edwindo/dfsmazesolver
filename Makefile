@@ -14,4 +14,5 @@ gdb:
 	gcc -g -std=gnu99 -pthread -o server_d server.c sel_repeat.c
 
 clean:
-	rm server client
+	rm -f server client server_d client_d
+	rm -r -f client_d.dSYM server_d.dSYM
