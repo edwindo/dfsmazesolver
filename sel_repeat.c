@@ -189,10 +189,9 @@ void* pth_send_packet(void* arg)
   struct pth_sp_arg* packet_arg;
   connect_meta* meta;
   note_thread_id(pthread_self());
+  packet_arg = (struct pth_sp_arg*)arg;
+  meta = meta_array[packet_arg->meta_i];
   while (1) {
-    packet_arg = (struct pth_sp_arg*)arg;
-    meta = meta_array[packet_arg->meta_i];
-
     sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header.length,
            0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
     printf("Sending packet %d %d\n", packet_arg->packet->header.sequence_num, WIN_SIZE);
@@ -281,18 +280,18 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     if (packet->header.sequence_num > meta->frame_base) {
       packet_offset = (packet->header.sequence_num - meta->frame_base) / PACK_LEN;
 	  meta->frame_base = packet->header.sequence_num;
-
-      /* Add to acked bitmap */
-      meta->acked_bmap |= (1 << packet_offset);
+	  
+	  uint8_t sent_bmap = meta->acked_bmap;
+	  sent_bmap >>= packet_offset; //Shift received packets out
 
       /* Update frame_base and start sending data packets */
-      while (meta->acked_bmap & 1) {
-        meta->acked_bmap >>= 1;
-        char send_pack_flag = 1;
+      for (int i_mask = 1; i_mask < (1 << (WIN_SIZE / PACK_LEN)); i_mask <<= 1) {
         pthread_mutex_lock(&meta->buf_mutex);
+		/* If this packet has already been sent */
+		if (sent_bmap & i_mask)
+	      continue;
         /* If there is enough data for a full packet */
-        if ((meta->buf_end - meta->buf_start) % BUF_SIZE >= DATA_LEN) {
-          
+        else if ((meta->buf_end - meta->buf_start) % BUF_SIZE >= DATA_LEN) {
 		  /* Determine if last packet */
 		  int fin = (meta->buf_complete && (meta->buf_start + DATA_LEN) % BUF_SIZE == meta->buf_end) ? 1 : 0;
 		  pth_arg = make_pack_arg(meta_i, meta->frame_base, PACK_LEN, 0, fin, 0); 
@@ -314,19 +313,18 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 
           meta->buf_start = meta->buf_end;
         }
-        else send_pack_flag = 0;
+        else 
+          break;
 
+	    sent_bmap |= i_mask;
         /* Unlock mutex */
         pthread_mutex_unlock(&meta->buf_mutex);
-		for (int i = 0; i < pth_arg->packet->header.length - sizeof(m_header); i++)
-			printf("%c", pth_arg->packet->data[i]);
-        if (send_pack_flag)
-          pthread_create(&thr, 0, pth_send_packet, pth_arg);
-
-        /* Increment the frame_base */
-        meta->frame_base += PACK_LEN;
+        pthread_create(&thr, 0, pth_send_packet, pth_arg);
       }
+	  /* Update acked_bmap */
+	  meta->acked_bmap = sent_bmap;
     }
+	printf("frame base: %d\n", meta->frame_base);
   }
 
   /* If this is a data packet */
@@ -339,8 +337,11 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
         return;
       meta->buffer[(meta->buf_end + i) % BUF_SIZE] = packet->data[i];
     }
-	meta->buf_end += packet->header.length - sizeof(m_header);
-	meta->buf_end %= BUF_SIZE;
+	if (packet->header.sequence_num == meta->frame_base) {
+	  meta->buf_end += packet->header.length - sizeof(m_header);
+	  meta->buf_end %= BUF_SIZE;
+  	  meta->acked_bmap >>= 1;
+	}
  
     /* Mark buffer complete if this is a FIN packet */
     if (packet->header.FIN)
@@ -348,7 +349,6 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 
     /* Add segment to acked_bmap */
     meta->acked_bmap |= (1 << packet_offset);
-	meta->acked_bmap >>= 1;
    
     /* Update buf_end for continuous data segments */
     while (meta->acked_bmap & 1) {
@@ -465,8 +465,6 @@ int write_sr(int meta_i, void *buf, unsigned int count)
     }
     pthread_create(&thr, 0, pth_send_packet, pth_arg);
   }
-  for (int i = meta->buf_start; i != meta->buf_end; i = (i + 1) % BUF_SIZE)
-	printf("%c", meta->buffer[i]);
   pthread_mutex_unlock(&meta->buf_mutex);
 
   return bytes_written;
