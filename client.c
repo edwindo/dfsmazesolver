@@ -20,7 +20,8 @@ int main(int argc, char* argv[]) {
     port = atoi(argv[1]);
 
   int meta_i = connect_rdt(port, "127.0.0.1");
-  write_sr(meta_i, "THIS IS A TEST", 15);
+  char* test = "THIS IS A TEST";
+  write_sr(meta_i, test, 14);
   mark_done(meta_i);
-  sleep(3);
+  finish_sr();
 }

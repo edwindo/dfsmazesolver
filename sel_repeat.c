@@ -76,11 +76,13 @@ void mark_done(int meta_i);
 int note_thread_id(pthread_t thr);
 int remove_thread_id(pthread_t thr);
 void* pth_maintain_pipe(void* arg);
+void finish_sr(void);
 
 /* Global variables */
 connect_meta* meta_array[CONNECTION_LIMIT] = {0, 0, 0, 0, 0, 0, 0, 0};
 pthread_t thread_id_array[THREAD_LIMIT];
 uint32_t thread_bitmap = 0;
+pthread_mutex_t thread_mutex;
 uint8_t pipe_maintainer_thread = 0;
 
 int connect_rdt(int port, char* hostname)
@@ -116,6 +118,7 @@ int connect_rdt(int port, char* hostname)
   if (!pipe_maintainer_thread) {
     int* udp_socket = malloc(sizeof(int));
     *udp_socket = meta->udp_socket;
+	pthread_mutex_init(&thread_mutex, 0);
     pthread_create(&th, 0, pth_maintain_pipe, (void*)udp_socket);
   }
 
@@ -303,7 +306,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
         /* If there is a nonzero amount of data, but we are done writing to buffer */
         else if ((meta->buf_complete == COMPLETE) && meta->buf_end != meta->buf_start) {
 		  int length = (meta->buf_end - meta->buf_start) % BUF_SIZE;
-          pth_arg = make_pack_arg(meta_i, meta->frame_base, length, 0, 1, 0);
+          pth_arg = make_pack_arg(meta_i, meta->frame_base, length + sizeof(m_header), 0, 1, 0);
 
           /* Copy bytes into data segment */
           for (int i = 0; i < response->header.length; i++)
@@ -315,6 +318,8 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 
         /* Unlock mutex */
         pthread_mutex_unlock(&meta->buf_mutex);
+		for (int i = 0; i < pth_arg->packet->header.length - sizeof(m_header); i++)
+			printf("%c", pth_arg->packet->data[i]);
         if (send_pack_flag)
           pthread_create(&thr, 0, pth_send_packet, pth_arg);
 
@@ -328,14 +333,14 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
   else {   
     pthread_mutex_lock(&meta->buf_mutex);
     /* Copy packet data into circular buffer */
-    for (int i = 0; i < packet->header.length; i++) {
+    for (int i = 0; i < packet->header.length - sizeof(m_header); i++) {
       /* If the buffer is too small for the data */
       if ((meta->buf_end + i + 1) % BUF_SIZE == meta->buf_start)
         return;
       meta->buffer[(meta->buf_end + i) % BUF_SIZE] = packet->data[i];
     }
-    meta->buf_end += packet->header.length;
-    meta->buf_end %= BUF_SIZE;
+	meta->buf_end += packet->header.length - sizeof(m_header);
+	meta->buf_end %= BUF_SIZE;
  
     /* Mark buffer complete if this is a FIN packet */
     if (packet->header.FIN)
@@ -343,6 +348,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 
     /* Add segment to acked_bmap */
     meta->acked_bmap |= (1 << packet_offset);
+	meta->acked_bmap >>= 1;
    
     /* Update buf_end for continuous data segments */
     while (meta->acked_bmap & 1) {
@@ -397,6 +403,8 @@ int read_sr(int meta_i, void *buf, unsigned int nbyte)
   char* m_buffer = meta->buffer;
   char* c_buf = (char*)buf;
   int length = (end - start) % BUF_SIZE;
+  if (length != 0)
+    printf("Length: %d\nBuf_start: %d\nBuf_end: %d\n", length, start, end);
 
   if (length == 0 && (meta->buf_complete == COMPLETE)) {
     return -1;
@@ -457,8 +465,10 @@ int write_sr(int meta_i, void *buf, unsigned int count)
     }
     pthread_create(&thr, 0, pth_send_packet, pth_arg);
   }
+  for (int i = meta->buf_start; i != meta->buf_end; i = (i + 1) % BUF_SIZE)
+	printf("%c", meta->buffer[i]);
   pthread_mutex_unlock(&meta->buf_mutex);
-	
+
   return bytes_written;
 }
 
@@ -476,31 +486,52 @@ void mark_done(int meta_i)
   pthread_mutex_unlock(&meta->buf_mutex);
 }
 
+
+
 int note_thread_id(pthread_t thr)
 {
+  pthread_mutex_lock(&thread_mutex);
   uint32_t mask = 1;
   for (int i = 0; i < THREAD_LIMIT; i++) {
     if ((thread_bitmap & mask) == 0) {
       thread_id_array[i] = thr;
       thread_bitmap |= mask;
+	  pthread_mutex_unlock(&thread_mutex);
       return i;
     } else
       mask <<= 1;
   }
+  pthread_mutex_unlock(&thread_mutex);
   return -1;
 }
   
 
 int remove_thread_id(pthread_t thr)
 {
+  pthread_mutex_lock(&thread_mutex);
   uint32_t mask = 1;
   for (int i = 0; i < THREAD_LIMIT; i++) {
     if ((thread_id_array[i] == thr) && ((thread_bitmap & mask) > 0)) {
       thread_bitmap &= ~mask;
+	  pthread_mutex_unlock(&thread_mutex);
       return i;
     }
     else
       mask <<= 1;
   }
+  pthread_mutex_unlock(&thread_mutex);
   return -1;
+}
+
+void finish_sr(void)
+{
+  while(1) {
+    for (int i = 0; i < CONNECTION_LIMIT; i++) {
+	  if (meta_array[i] != NULL && meta_array[i]->buf_end != meta_array[i]->buf_start)
+		break;
+	  else if (i == CONNECTION_LIMIT - 1)
+		return;
+	}
+    sched_yield();
+  }
 }
