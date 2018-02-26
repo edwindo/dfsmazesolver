@@ -31,6 +31,7 @@
 #define PRE_SEQ  0
 #define SENDING  1
 #define COMPLETE 2
+#define LISTEN   3
 
 typedef struct mikes_header {
   int16_t sequence_num;
@@ -49,11 +50,13 @@ typedef struct header_packet {
 typedef struct connect_metadata {
   /* Socket variables */
   int udp_socket;
+  int write_socket;
   struct sockaddr_in send_addr;
 
   /* Window variables */
   volatile uint16_t frame_base;
   volatile uint8_t  acked_bmap; // LSB = current packet, MSB = later packet
+  volatile uint8_t  sent_bmap;
 
   /* Buffer variables */
   pthread_mutex_t buf_mutex;
@@ -66,6 +69,7 @@ typedef struct connect_metadata {
 /* Function prototypes */
 int connect_rdt(int port, char* hostname);
 int init_serv(int port, char* hostname);
+int await_connection(int meta_i);
 struct pth_sp_arg* make_pack_arg(int meta_i, int sequence, int length, int SEQ, int FIN, int ACK);
 void* pth_send_packet(void* arg);
 void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd);
@@ -77,6 +81,8 @@ int note_thread_id(pthread_t thr);
 int remove_thread_id(pthread_t thr);
 void* pth_maintain_pipe(void* arg);
 void finish_sr(void);
+void print_packet_data(h_packet* packet);
+void print_meta_data(connect_meta* meta, int meta_i);
 
 /* Global variables */
 connect_meta* meta_array[CONNECTION_LIMIT] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -107,6 +113,9 @@ int connect_rdt(int port, char* hostname)
   meta->send_addr.sin_family = AF_INET;
   meta->send_addr.sin_port = htons(port);
   meta->send_addr.sin_addr.s_addr = inet_addr(hostname);
+  meta->frame_base = 0;
+  meta->acked_bmap = 0;
+  meta->sent_bmap = 0;
   pthread_mutex_init(&meta->buf_mutex, NULL);
   pthread_mutex_lock(&meta->buf_mutex);
   meta->buf_start = 0;
@@ -151,7 +160,7 @@ int init_serv(int port, char* hostname)
 
   meta->buf_start = 0;
   meta->buf_end = 0;
-  meta->buf_complete = PRE_SEQ;
+  meta->buf_complete = LISTEN;
 
   bind(meta->udp_socket, (struct sockaddr*)&meta->send_addr,
        sizeof(struct sockaddr_in));
@@ -164,6 +173,22 @@ int init_serv(int port, char* hostname)
   }
 
   return meta_i;
+}
+
+int await_connection(int meta_i)
+{
+  connect_meta* meta = meta_array[meta_i];
+  int* connections = (int*)meta->buffer;
+  while (1) {
+    pthread_mutex_lock(&meta->buf_mutex);
+	if (meta->buf_end != meta->buf_start) {
+	  int ret = connections[meta->buf_start++];
+	  pthread_mutex_unlock(&meta->buf_mutex);
+	  return ret;
+	}
+	pthread_mutex_unlock(&meta->buf_mutex);
+	sched_yield();
+  }
 }
 
 struct pth_sp_arg {
@@ -192,13 +217,16 @@ void* pth_send_packet(void* arg)
   packet_arg = (struct pth_sp_arg*)arg;
   meta = meta_array[packet_arg->meta_i];
   while (1) {
+	print_meta_data(meta, packet_arg->meta_i);
     sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header.length,
            0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
-    printf("Sending packet %d %d\n", packet_arg->packet->header.sequence_num, WIN_SIZE);
-
+    printf("Thread %d sending packet %d %d\n", pthread_self(), packet_arg->packet->header.sequence_num, WIN_SIZE);
+	print_packet_data(packet_arg->packet);
+	
     usleep(RT_TIMEOUT*1000);
     meta = meta_array[packet_arg->meta_i];
-    if (meta == NULL || meta->frame_base > packet_arg->packet->header.sequence_num)
+    if (meta == NULL || meta->frame_base > packet_arg->packet->header.sequence_num ||
+	    packet_arg->packet->header.ACK)
       break;
   }
   /* If this is the FIN packet, delete the metadata structure */
@@ -212,9 +240,10 @@ void* pth_send_packet(void* arg)
 
 void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 {
-  printf ("routing packet sequence: %d\n", packet->header.sequence_num);
+  printf("Routing Packet\n");
+  print_packet_data(packet); //DEBUG
   /* Local variables */
-  int meta_i, packet_offset;
+  int meta_i, listen_meta_i, packet_offset;
   h_packet* response;
   struct pth_sp_arg* pth_arg;
   pthread_t thr;
@@ -240,6 +269,15 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     meta_array[meta_i]->buf_end = 0;
 	meta_array[meta_i]->buf_complete = SENDING;
     pthread_mutex_unlock(&meta_array[meta_i]->buf_mutex);
+	/* Place meta_i in listening connecton buffer */
+    for (listen_meta_i = 0; listen_meta_i < CONNECTION_LIMIT; listen_meta_i++) {
+      if (meta_array[listen_meta_i] != NULL && meta_array[listen_meta_i]->buf_complete == LISTEN) {
+	    pthread_mutex_lock(&meta_array[listen_meta_i]->buf_mutex);
+		int* connections = (int*)meta_array[listen_meta_i]->buffer;
+		connections[meta_array[listen_meta_i]->buf_end++] = meta_i;
+		pthread_mutex_unlock(&meta_array[listen_meta_i]->buf_mutex);
+	  }
+	}
 
     /* ACK SEQ segment */
     response = malloc(sizeof(h_packet));
@@ -261,11 +299,13 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
   /* Otherwise try to find matching sender */
   for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++) {
     if (meta_array[meta_i] != NULL) {
-      if (send_addr->sin_addr.s_addr == meta_array[meta_i]->send_addr.sin_addr.s_addr)
+      if ((send_addr->sin_addr.s_addr == meta_array[meta_i]->send_addr.sin_addr.s_addr) &&
+	      (meta_array[meta_i]->buf_complete != LISTEN))
 		break;
     }
   }
   connect_meta* meta = meta_array[meta_i];
+  print_meta_data(meta, meta_i); //DEBUG
 
   /* If packet is out of window region */
   if (packet->header.sequence_num > meta->frame_base + WIN_SIZE - PACK_LEN)
@@ -279,22 +319,30 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     /* New ACK */
     if (packet->header.sequence_num > meta->frame_base) {
       packet_offset = (packet->header.sequence_num - meta->frame_base) / PACK_LEN;
-	  meta->frame_base = packet->header.sequence_num;
 	  
-	  uint8_t sent_bmap = meta->acked_bmap;
-	  sent_bmap >>= packet_offset; //Shift received packets out
+	  meta->acked_bmap |= (1 << packet_offset);
+	  if (packet_offset == 0) {
+		meta->acked_bmap >>= 1;
+		meta->sent_bmap >>= 1;
+		meta->frame_base = packet->header.sequence_num;
+	  }
+	  while (meta->acked_bmap & 0x01) {
+	    meta->acked_bmap >>= 1;
+		meta->sent_bmap >>= 1;
+		meta->frame_base += BUF_SIZE;
+	  }
 
       /* Update frame_base and start sending data packets */
-      for (int i_mask = 1; i_mask < (1 << (WIN_SIZE / PACK_LEN)); i_mask <<= 1) {
+      for (int i = 0; i < WIN_SIZE / PACK_LEN; i++) {
         pthread_mutex_lock(&meta->buf_mutex);
 		/* If this packet has already been sent */
-		if (sent_bmap & i_mask)
+		if (meta->sent_bmap & (1 << i))
 	      continue;
         /* If there is enough data for a full packet */
         else if ((meta->buf_end - meta->buf_start) % BUF_SIZE >= DATA_LEN) {
 		  /* Determine if last packet */
 		  int fin = (meta->buf_complete && (meta->buf_start + DATA_LEN) % BUF_SIZE == meta->buf_end) ? 1 : 0;
-		  pth_arg = make_pack_arg(meta_i, meta->frame_base, PACK_LEN, 0, fin, 0); 
+		  pth_arg = make_pack_arg(meta_i, meta->frame_base + i*PACK_LEN, PACK_LEN, 0, fin, 0); 
 				  
           /* Copy bytes into data segment */
           for (int i = 0; i < DATA_LEN; i++)
@@ -305,7 +353,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
         /* If there is a nonzero amount of data, but we are done writing to buffer */
         else if ((meta->buf_complete == COMPLETE) && meta->buf_end != meta->buf_start) {
 		  int length = (meta->buf_end - meta->buf_start) % BUF_SIZE;
-          pth_arg = make_pack_arg(meta_i, meta->frame_base, length + sizeof(m_header), 0, 1, 0);
+          pth_arg = make_pack_arg(meta_i, meta->frame_base + i*PACK_LEN, length + sizeof(m_header), 0, 1, 0);
 
           /* Copy bytes into data segment */
           for (int i = 0; i < response->header.length; i++)
@@ -316,13 +364,12 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
         else 
           break;
 
-	    sent_bmap |= i_mask;
+	    meta->sent_bmap |= (1 << i);
         /* Unlock mutex */
         pthread_mutex_unlock(&meta->buf_mutex);
+		printf("Responding....\n");
         pthread_create(&thr, 0, pth_send_packet, pth_arg);
       }
-	  /* Update acked_bmap */
-	  meta->acked_bmap = sent_bmap;
     }
 	printf("frame base: %d\n", meta->frame_base);
   }
@@ -453,11 +500,13 @@ int write_sr(int meta_i, void *buf, unsigned int count)
   /* Send SYN segment upon initial write */
   if ((meta->buf_complete == PRE_SEQ) && ((meta->buf_end - meta->buf_start) % BUF_SIZE >= DATA_LEN)) {
 	pth_arg = make_pack_arg(meta_i, 0, sizeof(m_header), 1, 0, 0);
+	meta->buf_complete = SENDING;
 	pthread_create(&thr, 0, pth_send_packet, pth_arg); 
   }
   /* If we didnt have enough data for a packet, but we do now! */
   else if (((meta->buf_end - meta->buf_start) % BUF_SIZE >= DATA_LEN) && 
-           ((meta->buf_end - meta->buf_start) % BUF_SIZE < DATA_LEN + count)) {
+           ((meta->buf_end - meta->buf_start) % BUF_SIZE < DATA_LEN + count) &&
+		   (meta->acked_bmap == 0)) {
     pth_arg = make_pack_arg(meta_i, 0, sizeof(h_packet), 0, 0, 0);
     for (int i = 0; i < DATA_LEN; i++) {
       pth_arg->packet->data[i] = meta->buffer[meta->buf_start];
@@ -528,8 +577,48 @@ void finish_sr(void)
 	  if (meta_array[i] != NULL && meta_array[i]->buf_end != meta_array[i]->buf_start)
 		break;
 	  else if (i == CONNECTION_LIMIT - 1)
-		return;
+		goto THREADS;
 	}
     sched_yield();
   }
+  
+  THREADS:
+  while(1) {
+	pthread_mutex_lock(&thread_mutex);
+	if (!thread_bitmap) {
+	  pthread_mutex_unlock(&thread_mutex);
+	  break;
+	}
+	pthread_mutex_unlock(&thread_mutex);
+	sched_yield();
+  }
+}
+
+void print_packet_data(h_packet* packet)
+{
+  printf("PACKET NUMBER: %d\n", packet->header.sequence_num);
+  printf("Length: %d\n", packet->header.length);
+  int bitfield = (packet->header.ACK << 2) | (packet->header.SEQ << 1) | packet->header.FIN;
+  printf("Bitfield: %02x\n", bitfield);
+  if (packet->header.length > sizeof(m_header))
+	write(1, packet->data, packet->header.length - sizeof(m_header));
+  printf("\n\n");
+}
+
+void print_meta_data(connect_meta* meta, int meta_i)
+{
+  printf("META %d\n", meta_i);
+  printf("Frame base: %d\n", meta->frame_base);
+  printf("Acked bitmap: %02x\n", meta->acked_bmap);
+  char string[20];
+  if (meta->buf_complete == PRE_SEQ)
+    strcpy(string, "PRE_SEQ");
+  else if (meta->buf_complete == SENDING)
+    strcpy(string, "SENDING");
+  else if (meta->buf_complete == COMPLETE)
+    strcpy(string, "COMPLETE");
+  else if (meta->buf_complete == LISTEN)
+    strcpy(string, "LISTEN");
+  printf("Buf complete: %s\n", string);
+  printf("Buf start: %d\n Buf end: %d\n", meta->buf_start, meta->buf_end);
 }

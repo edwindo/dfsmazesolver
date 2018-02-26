@@ -22,9 +22,11 @@ int main(int argc, char* argv[]) {
   int meta_i = init_serv(port, "");
   char buf[256];
   int nbyte;
-  while((nbyte = read_sr(meta_i, buf, 256)) >= 0) {
-    write(1, buf, nbyte);
+  int connect = await_connection(meta_i);
+  while((nbyte = read_sr(connect, buf, 256)) >= 0) {
+    //write(1, buf, nbyte);
+	;
   }
-  
+  finish_sr();
   printf("\nEnd of transmission\n");
 }
