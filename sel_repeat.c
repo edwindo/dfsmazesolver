@@ -35,8 +35,8 @@
 #define LISTEN   3
 
 /* Port definitions */
-#define PORT     52015
-#define ACK_PORT 52016
+#define PORT     32512
+#define ACK_PORT 32513
 
 typedef struct mikes_header {
   int16_t sequence_num;
@@ -116,13 +116,15 @@ int connect_rdt(char* hostname)
   /* Init metadata members */
   meta->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
   meta->ack_socket = socket(AF_INET, SOCK_DGRAM, 0);
+  bzero((void*)&meta->send_addr, sizeof(struct sockaddr_in));
   meta->send_addr.sin_family = AF_INET;
   meta->send_addr.sin_port = htons(ACK_PORT);
-  meta->send_addr.sin_addr.s_addr = inet_addr(hostname);
+  meta->send_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
   /* Bind ack_socket */
   bind(meta->ack_socket, (struct sockaddr*)&meta->send_addr,
        sizeof(struct sockaddr_in));
   meta->send_addr.sin_port = htons(PORT); //Change this back to data port
+  meta->send_addr.sin_port = inet_addr(hostname);
 
   meta->frame_base = 0;
   meta->acked_bmap = 0;
@@ -167,6 +169,7 @@ int init_serv(char* hostname)
   meta = meta_array[meta_i];
   meta->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
   meta->ack_socket = socket(AF_INET, SOCK_DGRAM, 0);
+  bzero((void*)&meta->send_addr, sizeof(struct sockaddr_in));
   meta->send_addr.sin_family = AF_INET;
   meta->send_addr.sin_port = htons(PORT);
   meta->send_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
@@ -232,13 +235,18 @@ void* pth_send_packet(void* arg)
   while (1) {
 	print_meta_data(meta, packet_arg->meta_i);
     /* Direct ACK packets to ack_socket */
-    if (packet_arg->packet.ACK)
+    if (packet_arg->packet->header.ACK)
       sendto(meta->ack_socket, packet_arg->packet, packet_arg->packet->header.length,
              0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
     else
       sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header.length,
              0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
     printf("Thread %d sending packet %d %d\n", pthread_self(), packet_arg->packet->header.sequence_num, WIN_SIZE);
+	char host[32];
+	int hostlen = 32;
+	getnameinfo((struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in),
+	            host, hostlen, NULL, 0, 0);
+	printf("Address: %s Port: %d\n", host, ntohs(meta->send_addr.sin_port));
 	print_packet_data(packet_arg->packet);
 	
     usleep(RT_TIMEOUT*1000);
@@ -440,6 +448,12 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 
 int fetch_packets(int udp_socket)
 {
+  //debug
+  //struct sockaddr_in sockadd;
+  //int sock_len = sizeof(sockadd);
+  //getsockname(udp_socket, (struct sockaddr*)&sockadd, &sock_len);
+  //printf("Fetching from port %d\n", ntohs(sockadd.sin_port));
+  
   char buf[PACK_LEN];
   struct sockaddr_in src_addr;
   socklen_t length = sizeof(struct sockaddr_in);
@@ -516,7 +530,7 @@ int write_sr(int meta_i, void *buf, unsigned int count)
     bytes_written++;
   }
   meta->buf_end = (end + bytes_written) % BUF_SIZE;
-  /* Send SYN segment upon initial write */
+  /* Send SEQ segment upon initial write */
   if ((meta->buf_complete == PRE_SEQ) && ((meta->buf_end - meta->buf_start) % BUF_SIZE >= DATA_LEN)) {
 	pth_arg = make_pack_arg(meta_i, 0, sizeof(m_header), 1, 0, 0);
 	meta->buf_complete = SENDING;
