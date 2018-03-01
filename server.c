@@ -11,15 +11,7 @@
 #include "sel_repeat.h"
 
 int main(int argc, char* argv[]) {
-  int port;
-  if (argc != 2) {
-    fprintf(stderr, "Erorr\n");
-    exit(1);
-  }
-  else
-    port = atoi(argv[1]);
-  
-  int meta_i = init_serv(port, "");
+  int meta_i = init_serv("");
   char buf[256];
   int nbyte;
   int connect = await_connection(meta_i);

@@ -11,15 +11,7 @@
 #include "sel_repeat.h"
 
 int main(int argc, char* argv[]) {
-  int port;
-  if (argc != 2) {
-    fprintf(stderr, "Erorr\n");
-    exit(1);
-  }
-  else
-    port = atoi(argv[1]);
-
-  int meta_i = connect_rdt(port, "127.0.0.1");
+  int meta_i = connect_rdt("127.0.0.1");
   char* test = "THIS IS A TWO HUNDRED AND FIFTY SIX CHARACTER STRING FOR TESTING OUR PROJECT REGARDING RELIABLE DATA TRANSFER IN A LOSSY NETWORK SETTING. UNFORTUNATELY I UNDERESTIMATED HOW MANY CHARACTERS TWO HUNDRED AND FIFTY SIX IS, SO NOW THIS IS JUST RAMBLING TO FILL";
   for (int i = 0; i < 10; i++)
     write_sr(meta_i, test, 256);

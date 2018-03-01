@@ -24,6 +24,7 @@
 
 #define BUF_SIZE (16*(PACK_LEN - sizeof(m_header)) + 1)
 #define DATA_LEN (PACK_LEN - sizeof(m_header))
+#define HEADER_LEN sizeof(m_header)
 #define CONNECTION_LIMIT 8
 #define THREAD_LIMIT 20
 
@@ -32,6 +33,10 @@
 #define SENDING  1
 #define COMPLETE 2
 #define LISTEN   3
+
+/* Port definitions */
+#define PORT     52015
+#define ACK_PORT 52016
 
 typedef struct mikes_header {
   int16_t sequence_num;
@@ -50,7 +55,7 @@ typedef struct header_packet {
 typedef struct connect_metadata {
   /* Socket variables */
   int udp_socket;
-  int write_socket;
+  int ack_socket;
   struct sockaddr_in send_addr;
 
   /* Window variables */
@@ -67,8 +72,8 @@ typedef struct connect_metadata {
 } connect_meta;
 
 /* Function prototypes */
-int connect_rdt(int port, char* hostname);
-int init_serv(int port, char* hostname);
+int connect_rdt(char* hostname);
+int init_serv(char* hostname);
 int await_connection(int meta_i);
 struct pth_sp_arg* make_pack_arg(int meta_i, int sequence, int length, int SEQ, int FIN, int ACK);
 void* pth_send_packet(void* arg);
@@ -91,7 +96,7 @@ uint32_t thread_bitmap = 0;
 pthread_mutex_t thread_mutex;
 uint8_t pipe_maintainer_thread = 0;
 
-int connect_rdt(int port, char* hostname)
+int connect_rdt(char* hostname)
 {
   /* Local variables */
   int meta_i;
@@ -107,15 +112,22 @@ int connect_rdt(int port, char* hostname)
     else if (meta_i == CONNECTION_LIMIT - 1)
       return -1;
   }
-  meta = meta_array[meta_i];
+  meta = meta_array[meta_i]; //To mitigate verbosity 
   /* Init metadata members */
   meta->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+  meta->ack_socket = socket(AF_INET, SOCK_DGRAM, 0);
   meta->send_addr.sin_family = AF_INET;
-  meta->send_addr.sin_port = htons(port);
+  meta->send_addr.sin_port = htons(ACK_PORT);
   meta->send_addr.sin_addr.s_addr = inet_addr(hostname);
+  /* Bind ack_socket */
+  bind(meta->ack_socket, (struct sockaddr*)&meta->send_addr,
+       sizeof(struct sockaddr_in));
+  meta->send_addr.sin_port = htons(PORT); //Change this back to data port
+
   meta->frame_base = 0;
   meta->acked_bmap = 0;
   meta->sent_bmap = 0;
+
   pthread_mutex_init(&meta->buf_mutex, NULL);
   pthread_mutex_lock(&meta->buf_mutex);
   meta->buf_start = 0;
@@ -125,16 +137,16 @@ int connect_rdt(int port, char* hostname)
 
   /* Dispatch maintainer thread */
   if (!pipe_maintainer_thread) {
-    int* udp_socket = malloc(sizeof(int));
-    *udp_socket = meta->udp_socket;
+    int* ack_socket = malloc(sizeof(int));
+    *ack_socket = meta->ack_socket;
 	pthread_mutex_init(&thread_mutex, 0);
-    pthread_create(&th, 0, pth_maintain_pipe, (void*)udp_socket);
+    pthread_create(&th, 0, pth_maintain_pipe, (void*)ack_socket);
   }
 
   return meta_i;
 }
 
-int init_serv(int port, char* hostname)
+int init_serv(char* hostname)
 {
   /* Local variables */
   int meta_i;
@@ -154,21 +166,22 @@ int init_serv(int port, char* hostname)
   /* Init metadata members */
   meta = meta_array[meta_i];
   meta->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
+  meta->ack_socket = socket(AF_INET, SOCK_DGRAM, 0);
   meta->send_addr.sin_family = AF_INET;
-  meta->send_addr.sin_port = htons(port);
+  meta->send_addr.sin_port = htons(PORT);
   meta->send_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+  bind(meta->udp_socket, (struct sockaddr*)&meta->send_addr,
+     sizeof(struct sockaddr_in));
 
   meta->buf_start = 0;
   meta->buf_end = 0;
   meta->buf_complete = LISTEN;
 
-  bind(meta->udp_socket, (struct sockaddr*)&meta->send_addr,
-       sizeof(struct sockaddr_in));
-
   /* Dispatch maintainer thread */
   if (!pipe_maintainer_thread) {
     int* udp_socket = malloc(sizeof(int));
     *udp_socket = meta->udp_socket;
+    pthread_mutex_init(&thread_mutex, 0);
     pthread_create(&th, 0, pth_maintain_pipe, (void*)udp_socket);
   }
 
@@ -187,7 +200,7 @@ int await_connection(int meta_i)
 	  return ret;
 	}
 	pthread_mutex_unlock(&meta->buf_mutex);
-	sched_yield();
+	sched_yield(); //Let other threads do some work
   }
 }
 
@@ -218,8 +231,13 @@ void* pth_send_packet(void* arg)
   meta = meta_array[packet_arg->meta_i];
   while (1) {
 	print_meta_data(meta, packet_arg->meta_i);
-    sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header.length,
-           0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
+    /* Direct ACK packets to ack_socket */
+    if (packet_arg->packet.ACK)
+      sendto(meta->ack_socket, packet_arg->packet, packet_arg->packet->header.length,
+             0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
+    else
+      sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header.length,
+             0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
     printf("Thread %d sending packet %d %d\n", pthread_self(), packet_arg->packet->header.sequence_num, WIN_SIZE);
 	print_packet_data(packet_arg->packet);
 	
@@ -229,8 +247,8 @@ void* pth_send_packet(void* arg)
 	    packet_arg->packet->header.ACK)
       break;
   }
-  /* If this is the FIN packet, delete the metadata structure */
-  if (packet_arg->packet->header.FIN) {
+  /* If this is the FIN (not ACK)packet, delete the metadata structure */
+  if (packet_arg->packet->header.FIN && !packet_arg->packet->header.ACK) {
     meta_array[packet_arg->meta_i] = NULL;
     free(meta);
   }
@@ -261,6 +279,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
         return;
     meta_array[meta_i]->udp_socket = sock_fd;
     meta_array[meta_i]->send_addr = *send_addr;
+    meta_array[meta_i]->send_addr.sin_port = htons(ACK_PORT); //we're gonna respond on a different port
     meta_array[meta_i]->frame_base = packet->header.sequence_num + packet->header.length;
     meta_array[meta_i]->acked_bmap = 0;
     pthread_mutex_init(&meta_array[meta_i]->buf_mutex, NULL);
@@ -356,8 +375,8 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
           pth_arg = make_pack_arg(meta_i, meta->frame_base + i*PACK_LEN, length + sizeof(m_header), 0, 1, 0);
 
           /* Copy bytes into data segment */
-          for (int i = 0; i < response->header.length; i++)
-            pth_arg->packet->data[i] = meta->buffer[(meta->buf_start + i) % BUF_SIZE];
+          for (int j = 0; j < response->header.length; j++)
+            pth_arg->packet->data[j] = meta->buffer[(meta->buf_start + j) % BUF_SIZE];
 
           meta->buf_start = meta->buf_end;
         }
