@@ -472,8 +472,8 @@ int fetch_packets(int udp_socket)
     if(recvfrom(udp_socket, buf, PACK_LEN, MSG_DONTWAIT, (struct sockaddr*)&src_addr, &length) < 0) {
 	  int temp_errno = errno;
       char* err_string = strerror(temp_errno);
-	  if (temp_errno != 11)
-        fprintf(stderr, "Error: %s\n", err_string);	
+	  //if (temp_errno != 11)
+      //  fprintf(stderr, "Error: %s\n", err_string);	
       return -1;
 	}
     route_packet((h_packet*)buf, &src_addr, udp_socket);
