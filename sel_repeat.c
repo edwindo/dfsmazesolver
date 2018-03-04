@@ -21,6 +21,7 @@
 #include <string.h>
 #include <time.h>
 #include <sched.h>
+#include <errno.h>
 
 #define BUF_SIZE (16*(PACK_LEN - sizeof(m_header)) + 1)
 #define DATA_LEN (PACK_LEN - sizeof(m_header))
@@ -35,8 +36,8 @@
 #define LISTEN   3
 
 /* Port definitions */
-#define PORT     32512
-#define ACK_PORT 32513
+#define PORT     13013
+#define ACK_PORT 13018
 
 typedef struct mikes_header {
   int16_t sequence_num;
@@ -117,14 +118,19 @@ int connect_rdt(char* hostname)
   meta->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
   meta->ack_socket = socket(AF_INET, SOCK_DGRAM, 0);
   bzero((void*)&meta->send_addr, sizeof(struct sockaddr_in));
+  
+  struct sockaddr_in* ack_addr = malloc(sizeof(struct sockaddr_in));
+  bzero((void*)ack_addr, sizeof(struct sockaddr_in));
+  ack_addr->sin_family = AF_INET;
+  ack_addr->sin_port = htons(ACK_PORT);
+  ack_addr->sin_addr.s_addr = inet_addr("127.0.0.1");
+  
   meta->send_addr.sin_family = AF_INET;
-  meta->send_addr.sin_port = htons(ACK_PORT);
-  meta->send_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+  meta->send_addr.sin_port = htons(PORT);
+  meta->send_addr.sin_addr.s_addr = inet_addr(hostname);
   /* Bind ack_socket */
-  bind(meta->ack_socket, (struct sockaddr*)&meta->send_addr,
+  bind(meta->ack_socket, (struct sockaddr*)ack_addr,
        sizeof(struct sockaddr_in));
-  meta->send_addr.sin_port = htons(PORT); //Change this back to data port
-  meta->send_addr.sin_port = inet_addr(hostname);
 
   meta->frame_base = 0;
   meta->acked_bmap = 0;
@@ -141,6 +147,7 @@ int connect_rdt(char* hostname)
   if (!pipe_maintainer_thread) {
     int* ack_socket = malloc(sizeof(int));
     *ack_socket = meta->ack_socket;
+	printf("%d\n", *ack_socket);
 	pthread_mutex_init(&thread_mutex, 0);
     pthread_create(&th, 0, pth_maintain_pipe, (void*)ack_socket);
   }
@@ -185,6 +192,7 @@ int init_serv(char* hostname)
     int* udp_socket = malloc(sizeof(int));
     *udp_socket = meta->udp_socket;
     pthread_mutex_init(&thread_mutex, 0);
+	printf("%d\n", *udp_socket);
     pthread_create(&th, 0, pth_maintain_pipe, (void*)udp_socket);
   }
 
@@ -448,18 +456,26 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 
 int fetch_packets(int udp_socket)
 {
+  //printf("%d\n", udp_socket);
   //debug
   //struct sockaddr_in sockadd;
-  //int sock_len = sizeof(sockadd);
-  //getsockname(udp_socket, (struct sockaddr*)&sockadd, &sock_len);
-  //printf("Fetching from port %d\n", ntohs(sockadd.sin_port));
+  // int sock_len = sizeof(sockadd);
+  // getsockname(udp_socket, (struct sockaddr*)&sockadd, &sock_len);
+  // char buff[32];
+  // getnameinfo((struct sockaddr*)&sockadd, sizeof(sockadd), buff, 32, NULL, 0, 0);
+  // printf("Fetching from port %d, %s\n", ntohs(sockadd.sin_port), buff);
   
   char buf[PACK_LEN];
   struct sockaddr_in src_addr;
   socklen_t length = sizeof(struct sockaddr_in);
   while (1) {
-    if(recvfrom(udp_socket, buf, PACK_LEN, MSG_DONTWAIT, (struct sockaddr*)&src_addr, &length) < 0)
+    if(recvfrom(udp_socket, buf, PACK_LEN, MSG_DONTWAIT, (struct sockaddr*)&src_addr, &length) < 0) {
+	  int temp_errno = errno;
+      char* err_string = strerror(temp_errno);
+	  if (temp_errno != 11)
+        fprintf(stderr, "Error: %s\n", err_string);	
       return -1;
+	}
     route_packet((h_packet*)buf, &src_addr, udp_socket);
   }
 }
