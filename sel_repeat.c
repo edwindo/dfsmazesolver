@@ -175,7 +175,6 @@ int init_serv(char* hostname)
   /* Init metadata members */
   meta = meta_array[meta_i];
   meta->udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
-  meta->ack_socket = socket(AF_INET, SOCK_DGRAM, 0);
   bzero((void*)&meta->send_addr, sizeof(struct sockaddr_in));
   meta->send_addr.sin_family = AF_INET;
   meta->send_addr.sin_port = htons(PORT);
@@ -230,11 +229,13 @@ struct pth_sp_arg* make_pack_arg(int meta_i, int sequence, int length, int SEQ, 
   packet->header.FIN = FIN;
   packet->header.ACK = ACK;
   pack_arg->packet = packet;
+  pack_arg->meta_i = meta_i;
   return pack_arg;
 }
 
 void* pth_send_packet(void* arg)
 {
+  pthread_detach(pthread_self());
   struct pth_sp_arg* packet_arg;
   connect_meta* meta;
   note_thread_id(pthread_self());
@@ -243,12 +244,16 @@ void* pth_send_packet(void* arg)
   while (1) {
 	print_meta_data(meta, packet_arg->meta_i);
     /* Direct ACK packets to ack_socket */
-    if (packet_arg->packet->header.ACK)
+    if (packet_arg->packet->header.ACK) {
+	  printf("sending an ACK\n");
       sendto(meta->ack_socket, packet_arg->packet, packet_arg->packet->header.length,
              0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
-    else
+	}
+    else {
+	  printf("not an ACK");
       sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header.length,
              0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
+	}
     printf("Thread %d sending packet %d %d\n", pthread_self(), packet_arg->packet->header.sequence_num, WIN_SIZE);
 	char host[32];
 	int hostlen = 32;
@@ -259,7 +264,7 @@ void* pth_send_packet(void* arg)
 	
     usleep(RT_TIMEOUT*1000);
     meta = meta_array[packet_arg->meta_i];
-    if (meta == NULL || meta->frame_base > packet_arg->packet->header.sequence_num ||
+    if (meta == NULL || meta->frame_base >= packet_arg->packet->header.sequence_num ||
 	    packet_arg->packet->header.ACK)
       break;
   }
@@ -274,7 +279,7 @@ void* pth_send_packet(void* arg)
 
 void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 {
-  printf("Routing Packet\n");
+  printf("~~~~~~~~~~~~~~~~~~\nRouting Packet\n~~~~~~~~~~~~~~~~~~~~\n");
   print_packet_data(packet); //DEBUG
   /* Local variables */
   int meta_i, listen_meta_i, packet_offset;
@@ -294,7 +299,9 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
       else if (meta_i == CONNECTION_LIMIT - 1)
         return;
     meta_array[meta_i]->udp_socket = sock_fd;
-    meta_array[meta_i]->send_addr = *send_addr;
+	meta_array[meta_i]->ack_socket = socket(AF_INET, SOCK_DGRAM, 0);
+	meta_array[meta_i]->send_addr.sin_family = AF_INET;
+    meta_array[meta_i]->send_addr.sin_addr.s_addr = send_addr->sin_addr.s_addr;
     meta_array[meta_i]->send_addr.sin_port = htons(ACK_PORT); //we're gonna respond on a different port
     meta_array[meta_i]->frame_base = packet->header.sequence_num + packet->header.length;
     meta_array[meta_i]->acked_bmap = 0;
@@ -339,6 +346,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 		break;
     }
   }
+  printf("DISCOVERED META %d", meta_i);
   connect_meta* meta = meta_array[meta_i];
   print_meta_data(meta, meta_i); //DEBUG
 
@@ -347,16 +355,16 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     return;
 
   /* Number of packets ahead */
-  packet_offset = (packet->header.sequence_num - meta->frame_base) / PACK_LEN;
+  packet_offset = (packet->header.sequence_num - meta->frame_base) / PACK_LEN - 1;
 
   /* If this is an ACK segment */
   if (packet->header.ACK) {
     /* New ACK */
     if (packet->header.sequence_num > meta->frame_base) {
-      packet_offset = (packet->header.sequence_num - meta->frame_base) / PACK_LEN;
-	  
+
+	  printf("OFFSET (QUAVO): %d\n", packet_offset);
 	  meta->acked_bmap |= (1 << packet_offset);
-	  if (packet_offset == 0) {
+	  if (packet_offset <= 0) {
 		meta->acked_bmap >>= 1;
 		meta->sent_bmap >>= 1;
 		meta->frame_base = packet->header.sequence_num;
@@ -367,7 +375,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 		meta->frame_base += BUF_SIZE;
 	  }
 
-      /* Update frame_base and start sending data packets */
+      /* Start sending data packets */
       for (int i = 0; i < WIN_SIZE / PACK_LEN; i++) {
         pthread_mutex_lock(&meta->buf_mutex);
 		/* If this packet has already been sent */
@@ -391,7 +399,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
           pth_arg = make_pack_arg(meta_i, meta->frame_base + i*PACK_LEN, length + sizeof(m_header), 0, 1, 0);
 
           /* Copy bytes into data segment */
-          for (int j = 0; j < response->header.length; j++)
+          for (int j = 0; j < pth_arg->packet->header.length; j++)
             pth_arg->packet->data[j] = meta->buffer[(meta->buf_start + j) % BUF_SIZE];
 
           meta->buf_start = meta->buf_end;
@@ -448,7 +456,6 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     /* Send individual ACK */
 	int sequence = packet->header.sequence_num + packet->header.length;
 	pth_arg = make_pack_arg(meta_i, sequence, sizeof(m_header), 0, packet->header.FIN, 1);
-	
     pthread_create(&thr, 0, pth_send_packet, pth_arg);
   }
   return;
@@ -482,11 +489,12 @@ int fetch_packets(int udp_socket)
 
 void* pth_maintain_pipe(void* arg)
 {
+  pthread_detach(pthread_self());
   note_thread_id(pthread_self());
   pipe_maintainer_thread = 1;
   while (1) {
     fetch_packets(*(int*)arg);
-    sched_yield();
+    //sched_yield();
   }
 }
 
