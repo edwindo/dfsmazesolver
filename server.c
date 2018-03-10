@@ -16,8 +16,7 @@ int main(int argc, char* argv[]) {
   int nbyte;
   int connect = await_connection(meta_i);
   while((nbyte = read_sr(connect, buf, 256)) >= 0) {
-    //write(1, buf, nbyte);
-	;
+    write(1, buf, nbyte);
   }
   finish_sr();
   printf("\nEnd of transmission\n");

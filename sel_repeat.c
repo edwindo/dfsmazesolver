@@ -147,7 +147,6 @@ int connect_rdt(char* hostname)
   if (!pipe_maintainer_thread) {
     int* ack_socket = malloc(sizeof(int));
     *ack_socket = meta->ack_socket;
-	printf("%d\n", *ack_socket);
 	pthread_mutex_init(&thread_mutex, 0);
     pthread_create(&th, 0, pth_maintain_pipe, (void*)ack_socket);
   }
@@ -191,7 +190,6 @@ int init_serv(char* hostname)
     int* udp_socket = malloc(sizeof(int));
     *udp_socket = meta->udp_socket;
     pthread_mutex_init(&thread_mutex, 0);
-	printf("%d\n", *udp_socket);
     pthread_create(&th, 0, pth_maintain_pipe, (void*)udp_socket);
   }
 
@@ -242,25 +240,21 @@ void* pth_send_packet(void* arg)
   packet_arg = (struct pth_sp_arg*)arg;
   meta = meta_array[packet_arg->meta_i];
   while (1) {
-	print_meta_data(meta, packet_arg->meta_i);
+	//print_meta_data(meta, packet_arg->meta_i);
     /* Direct ACK packets to ack_socket */
     if (packet_arg->packet->header.ACK) {
-	  printf("sending an ACK\n");
       sendto(meta->ack_socket, packet_arg->packet, packet_arg->packet->header.length,
              0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
 	}
     else {
-	  printf("not an ACK");
       sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header.length,
              0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
 	}
-    printf("Thread %d sending packet %d %d\n", pthread_self(), packet_arg->packet->header.sequence_num, WIN_SIZE);
 	char host[32];
 	int hostlen = 32;
 	getnameinfo((struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in),
 	            host, hostlen, NULL, 0, 0);
-	printf("Address: %s Port: %d\n", host, ntohs(meta->send_addr.sin_port));
-	print_packet_data(packet_arg->packet);
+	//print_packet_data(packet_arg->packet);
 	
     usleep(RT_TIMEOUT*1000);
     meta = meta_array[packet_arg->meta_i];
@@ -279,8 +273,7 @@ void* pth_send_packet(void* arg)
 
 void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 {
-  printf("~~~~~~~~~~~~~~~~~~\nRouting Packet\n~~~~~~~~~~~~~~~~~~~~\n");
-  print_packet_data(packet); //DEBUG
+  //print_packet_data(packet); //DEBUG
   /* Local variables */
   int meta_i, listen_meta_i, packet_offset;
   h_packet* response;
@@ -334,7 +327,6 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     pth_arg->packet = response;
     pthread_create(&thr, 0, pth_send_packet, pth_arg);
 
-    printf("Receiving packet SYN\n");
     return;
   }
 
@@ -346,9 +338,8 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 		break;
     }
   }
-  printf("DISCOVERED META %d", meta_i);
   connect_meta* meta = meta_array[meta_i];
-  print_meta_data(meta, meta_i); //DEBUG
+  //print_meta_data(meta, meta_i); //DEBUG
 
   /* If packet is out of window region */
   if (packet->header.sequence_num > meta->frame_base + WIN_SIZE - PACK_LEN)
@@ -362,7 +353,6 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     /* New ACK */
     if (packet->header.sequence_num > meta->frame_base) {
 
-	  printf("OFFSET (QUAVO): %d\n", packet_offset);
 	  meta->acked_bmap |= (1 << packet_offset);
 	  if (packet_offset <= 0) {
 		meta->acked_bmap >>= 1;
@@ -379,8 +369,10 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
       for (int i = 0; i < WIN_SIZE / PACK_LEN; i++) {
         pthread_mutex_lock(&meta->buf_mutex);
 		/* If this packet has already been sent */
-		if (meta->sent_bmap & (1 << i))
+		if (meta->sent_bmap & (1 << i)) {
+		  pthread_mutex_unlock(&meta->buf_mutex);
 	      continue;
+		}
         /* If there is enough data for a full packet */
         else if ((meta->buf_end - meta->buf_start) % BUF_SIZE >= DATA_LEN) {
 		  /* Determine if last packet */
@@ -404,17 +396,17 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 
           meta->buf_start = meta->buf_end;
         }
-        else 
+        else {
+          pthread_mutex_unlock(&meta->buf_mutex);
           break;
+        }
 
 	    meta->sent_bmap |= (1 << i);
         /* Unlock mutex */
         pthread_mutex_unlock(&meta->buf_mutex);
-		printf("Responding....\n");
         pthread_create(&thr, 0, pth_send_packet, pth_arg);
       }
     }
-	printf("frame base: %d\n", meta->frame_base);
   }
 
   /* If this is a data packet */
@@ -423,8 +415,10 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     /* Copy packet data into circular buffer */
     for (int i = 0; i < packet->header.length - sizeof(m_header); i++) {
       /* If the buffer is too small for the data */
-      if ((meta->buf_end + i + 1) % BUF_SIZE == meta->buf_start)
+      if ((meta->buf_end + i + 1) % BUF_SIZE == meta->buf_start) {
+		pthread_mutex_unlock(&meta->buf_mutex);
         return;
+	  }
       meta->buffer[(meta->buf_end + i) % BUF_SIZE] = packet->data[i];
     }
 	if (packet->header.sequence_num == meta->frame_base) {
@@ -455,7 +449,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     pthread_mutex_unlock(&meta->buf_mutex);
     /* Send individual ACK */
 	int sequence = packet->header.sequence_num + packet->header.length;
-	pth_arg = make_pack_arg(meta_i, sequence, sizeof(m_header), 0, packet->header.FIN, 1);
+	pth_arg = make_pack_arg(meta_i, sequence, HEADER_LEN, 0, packet->header.FIN, 1);
     pthread_create(&thr, 0, pth_send_packet, pth_arg);
   }
   return;
@@ -475,22 +469,24 @@ int fetch_packets(int udp_socket)
   char buf[PACK_LEN];
   struct sockaddr_in src_addr;
   socklen_t length = sizeof(struct sockaddr_in);
-  while (1) {
-    if(recvfrom(udp_socket, buf, PACK_LEN, MSG_DONTWAIT, (struct sockaddr*)&src_addr, &length) < 0) {
-	  int temp_errno = errno;
-      char* err_string = strerror(temp_errno);
-	  //if (temp_errno != 11)
-      //  fprintf(stderr, "Error: %s\n", err_string);	
-      return -1;
-	}
-    route_packet((h_packet*)buf, &src_addr, udp_socket);
+  int msg_len;
+
+  if((msg_len = recvfrom(udp_socket, buf, HEADER_LEN, MSG_DONTWAIT | MSG_PEEK, (struct sockaddr*)&src_addr, &length)) < 0) {
+    int temp_errno = errno;
+    char* err_string = strerror(temp_errno);
+    //if (temp_errno != 11)
+    //  printf(stderr, "Error: %s\n", err_string);	
+    return -1;
   }
+  h_packet* buf_pack = (h_packet*)buf;
+  msg_len = recvfrom(udp_socket, buf, buf_pack->header.length, 0, (struct sockaddr*)&src_addr, &length);
+  route_packet(buf_pack, &src_addr, udp_socket);
 }
 
 void* pth_maintain_pipe(void* arg)
 {
   pthread_detach(pthread_self());
-  note_thread_id(pthread_self());
+  //note_thread_id(pthread_self());
   pipe_maintainer_thread = 1;
   while (1) {
     fetch_packets(*(int*)arg);
@@ -507,10 +503,9 @@ int read_sr(int meta_i, void *buf, unsigned int nbyte)
   char* m_buffer = meta->buffer;
   char* c_buf = (char*)buf;
   int length = (end - start) % BUF_SIZE;
-  if (length != 0)
-    printf("Length: %d\nBuf_start: %d\nBuf_end: %d\n", length, start, end);
 
   if (length == 0 && (meta->buf_complete == COMPLETE)) {
+    pthread_mutex_unlock(&meta->buf_mutex);
     return -1;
   }
 
@@ -526,7 +521,6 @@ int read_sr(int meta_i, void *buf, unsigned int nbyte)
 
   meta->buf_start = (start + bytes_read) % BUF_SIZE;
   pthread_mutex_unlock(&meta->buf_mutex);
-
   return bytes_read;
 
 }
