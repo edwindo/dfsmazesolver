@@ -45,6 +45,7 @@ typedef struct mikes_header {
   uint8_t SEQ : 1;
   uint8_t FIN : 1;
   uint8_t ACK : 1;
+  uint8_t SENT: 1;
   uint8_t     : 0;
 } m_header;
 
@@ -89,6 +90,9 @@ void* pth_maintain_pipe(void* arg);
 void finish_sr(void);
 void print_packet_data(h_packet* packet);
 void print_meta_data(connect_meta* meta, int meta_i);
+void init_summary(void);
+void print_summary(void);
+void add_to_sum(m_header header);
 
 /* Global variables */
 connect_meta* meta_array[CONNECTION_LIMIT] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -96,6 +100,11 @@ pthread_t thread_id_array[THREAD_LIMIT];
 uint32_t thread_bitmap = 0;
 pthread_mutex_t thread_mutex;
 uint8_t pipe_maintainer_thread = 0;
+m_header* packet_sum = NULL;
+pthread_mutex_t sum_mutex;
+int sum_elements = 0;
+int sum_size = 0;
+
 
 int connect_rdt(char* hostname)
 {
@@ -250,6 +259,10 @@ void* pth_send_packet(void* arg)
       sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header.length,
              0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
 	}
+    if (packet_sum) {
+      packet_arg->packet->header.SENT = 1;
+      add_to_sum(packet_arg->packet->header);
+    }
 	char host[32];
 	int hostlen = 32;
 	getnameinfo((struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in),
@@ -268,11 +281,17 @@ void* pth_send_packet(void* arg)
     free(meta);
   }
   remove_thread_id(pthread_self());
+  free(packet_arg->packet);
+  free(packet_arg);
   return NULL;
 }
 
 void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 {
+  if (packet_sum) {
+    packet->header.SENT = 0;
+    add_to_sum(packet->header);
+  }
   //print_packet_data(packet); //DEBUG
   /* Local variables */
   int meta_i, listen_meta_i, packet_offset;
@@ -672,4 +691,39 @@ void print_meta_data(connect_meta* meta, int meta_i)
     strcpy(string, "LISTEN");
   printf("Buf complete: %s\n", string);
   printf("Buf start: %d\n Buf end: %d\n", meta->buf_start, meta->buf_end);
+}
+
+void init_summary(void)
+{
+  pthread_mutex_init(&sum_mutex, 0);
+  pthread_mutex_lock(&sum_mutex);
+  packet_sum = malloc(50*sizeof(m_header));
+  sum_size = 50;
+  pthread_mutex_unlock(&sum_mutex);
+}
+
+void print_summary(void)
+{
+  pthread_mutex_lock(&sum_mutex);
+  printf("SENT/RECEIVED  NO ACK SYN FIN LENGTH\n");
+  for (int i = 0; i < sum_elements; i++) {
+    if (packet_sum[i].SENT == 0)
+      printf("RECEIVED %8d   %1d   %1d   %1d   %4d\n", packet_sum[i].sequence_num, 
+             packet_sum[i].ACK, packet_sum[i].SEQ, packet_sum[i].FIN, packet_sum[i].length);
+    else
+      printf("SENT     %8d   %1d   %1d   %1d   %4d\n", packet_sum[i].sequence_num, 
+             packet_sum[i].ACK, packet_sum[i].SEQ, packet_sum[i].FIN, packet_sum[i].length);
+  }
+  pthread_mutex_unlock(&sum_mutex);
+}
+
+void add_to_sum(m_header header)
+{
+  pthread_mutex_lock(&sum_mutex);
+  if (sum_elements == sum_size) {
+    sum_size += 50;
+    packet_sum = realloc(packet_sum, sum_size);
+  }
+  packet_sum[sum_elements++] = header;
+  pthread_mutex_unlock(&sum_mutex);
 }

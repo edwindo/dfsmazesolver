@@ -20,5 +20,7 @@ int write_sr(int meta_i, void *buf, unsigned int count);
 void mark_done(int meta_i);
 void finish_sr(void);
 int await_connection(int meta_i);
+void init_summary(void);
+void print_summary(void);
 
 #endif

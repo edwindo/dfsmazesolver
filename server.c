@@ -12,12 +12,15 @@
 
 int main(int argc, char* argv[]) {
   int meta_i = init_serv("");
+  init_summary();
   char buf[256];
   int nbyte;
   int connect = await_connection(meta_i);
   while((nbyte = read_sr(connect, buf, 256)) >= 0) {
     write(1, buf, nbyte);
   }
+  printf("\n");
   finish_sr();
+  print_summary();
   printf("\nEnd of transmission\n");
 }
