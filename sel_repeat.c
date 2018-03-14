@@ -273,7 +273,10 @@ void* pth_send_packet(void* arg)
     meta = meta_array[packet_arg->meta_i];
     if (meta == NULL || meta->frame_base >= packet_arg->packet->header.sequence_num ||
 	    packet_arg->packet->header.ACK)
+    {
       break;
+    }
+    printf("PACKET LOST FAGGOT\n");
   }
   /* If this is the FIN (not ACK)packet, delete the metadata structure */
   if (packet_arg->packet->header.FIN && !packet_arg->packet->header.ACK) {
@@ -369,6 +372,8 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 
   /* If this is an ACK segment */
   if (packet->header.ACK) {
+    if(packet->header.FIN)
+      meta->buf_complete = COMPLETE;
     /* New ACK */
     if (packet->header.sequence_num > meta->frame_base) {
 
@@ -644,8 +649,8 @@ void finish_sr(void)
 {
   while(1) {
     for (int i = 0; i < CONNECTION_LIMIT; i++) {
-	  if (meta_array[i] != NULL && meta_array[i]->buf_end != meta_array[i]->buf_start)
-		break;
+	  if (meta_array[i] != NULL && (meta_array[i]->buf_complete == COMPLETE || meta_array[i]->buf_complete == LISTEN))
+		  break;
 	  else if (i == CONNECTION_LIMIT - 1)
 		goto THREADS;
 	}
