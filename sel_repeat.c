@@ -34,6 +34,7 @@
 #define SENDING  1
 #define COMPLETE 2
 #define LISTEN   3
+#define FIN_BUF  4
 
 /* Port definitions */
 #define PORT     13013
@@ -292,7 +293,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     packet->header.SENT = 0;
     add_to_sum(packet->header);
   }
-  //print_packet_data(packet); //DEBUG
+  print_packet_data(packet); //DEBUG
   /* Local variables */
   int meta_i, listen_meta_i, packet_offset;
   h_packet* response;
@@ -373,7 +374,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
   /* If this is an ACK segment */
   if (packet->header.ACK) {
     if (packet->header.FIN)
-      meta->buf_complete = COMPLETE;
+      meta->buf_complete = FIN_BUF;
     /* New ACK */
     if (packet->header.sequence_num > meta->frame_base) {
 
@@ -453,7 +454,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
  
     /* Mark buffer complete if this is a FIN packet */
     if (packet->header.FIN)
-      meta->buf_complete = COMPLETE;
+      meta->buf_complete = FIN_BUF;
 
     /* Add segment to acked_bmap */
     meta->acked_bmap |= (1 << packet_offset);
@@ -649,8 +650,8 @@ void finish_sr(void)
 {
   while(1) {
     for (int i = 0; i < CONNECTION_LIMIT; i++) {
-	  if (meta_array[i] != NULL && (meta_array[i]->buf_complete == COMPLETE || 
-          meta_array[i]->buf_complete == LISTEN))
+	  if (meta_array[i] != NULL && meta_array[i]->buf_complete != FIN_BUF && 
+          meta_array[i]->buf_complete != LISTEN)
 		break;
 	  else if (i == CONNECTION_LIMIT - 1)
 		goto THREADS;
@@ -672,7 +673,7 @@ void finish_sr(void)
 
 void print_packet_data(h_packet* packet)
 {
-  printf("PACKET NUMBER: %d\n", packet->header.sequence_num);
+  printf("PACKET %s: %d\n", (packet->header.SENT ? "SENT" : "RECEIVED"), packet->header.sequence_num);
   printf("Length: %d\n", packet->header.length);
   int bitfield = (packet->header.ACK << 2) | (packet->header.SEQ << 1) | packet->header.FIN;
   printf("Bitfield: %02x\n", bitfield);
@@ -695,6 +696,8 @@ void print_meta_data(connect_meta* meta, int meta_i)
     strcpy(string, "COMPLETE");
   else if (meta->buf_complete == LISTEN)
     strcpy(string, "LISTEN");
+  else if (meta->buf_complete == FIN_BUF)
+    strcpy(string, "FIN");
   printf("Buf complete: %s\n", string);
   printf("Buf start: %d\n Buf end: %d\n", meta->buf_start, meta->buf_end);
 }
