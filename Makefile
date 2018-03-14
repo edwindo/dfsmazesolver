@@ -16,3 +16,7 @@ gdb:
 clean:
 	rm -f server client server_d client_d
 	rm -r -f client_d.dSYM server_d.dSYM
+	rm -f project2_004620459_904637634.tar.gz
+
+dist:
+	tar -czf project2_004620459_904637634.tar.gz client.c server.c sel_repeat.c sel_repeat.h Makefile
