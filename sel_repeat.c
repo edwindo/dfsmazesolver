@@ -61,7 +61,7 @@ typedef struct connect_metadata {
   struct sockaddr_in send_addr;
 
   /* Window variables */
-  volatile uint16_t frame_base;
+  volatile int16_t frame_base;
   volatile uint8_t  acked_bmap; // LSB = current packet, MSB = later packet
   volatile uint8_t  sent_bmap;
 
@@ -141,7 +141,7 @@ int connect_rdt(char* hostname)
   bind(meta->ack_socket, (struct sockaddr*)ack_addr,
        sizeof(struct sockaddr_in));
 
-  meta->frame_base = 0;
+  meta->frame_base = -1;
   meta->acked_bmap = 0;
   meta->sent_bmap = 0;
 
@@ -249,7 +249,7 @@ void* pth_send_packet(void* arg)
   packet_arg = (struct pth_sp_arg*)arg;
   meta = meta_array[packet_arg->meta_i];
   while (1) {
-	//print_meta_data(meta, packet_arg->meta_i);
+	print_meta_data(meta, packet_arg->meta_i);
     /* Direct ACK packets to ack_socket */
     if (packet_arg->packet->header.ACK) {
       sendto(meta->ack_socket, packet_arg->packet, packet_arg->packet->header.length,
@@ -267,11 +267,11 @@ void* pth_send_packet(void* arg)
 	int hostlen = 32;
 	getnameinfo((struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in),
 	            host, hostlen, NULL, 0, 0);
-	//print_packet_data(packet_arg->packet);
+	print_packet_data(packet_arg->packet);
 	
     usleep(RT_TIMEOUT*1000);
     meta = meta_array[packet_arg->meta_i];
-    if (meta == NULL || meta->frame_base >= packet_arg->packet->header.sequence_num ||
+    if (meta == NULL || meta->frame_base > packet_arg->packet->header.sequence_num ||
 	    packet_arg->packet->header.ACK)
       break;
   }
@@ -303,16 +303,32 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 
   /* If this is the initial SEQ packet */
   if (packet->header.SEQ && !packet->header.ACK) {
-    for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++)
+    /* ACK SEQ segment */
+    response = malloc(sizeof(h_packet));
+    response->header.sequence_num = packet->header.sequence_num + packet->header.length;
+    response->header.length = sizeof(m_header);
+    response->header.SEQ = 1;
+    response->header.ACK = 1;
+    response->header.FIN = 0;
+    
+    pth_arg = malloc(sizeof(struct pth_sp_arg));
+    pth_arg->meta_i = meta_i;
+    pth_arg->packet = response;
+    pthread_create(&thr, 0, pth_send_packet, pth_arg);
+
+    /* Allocate meta_array */
+    for (meta_i = 0; ; meta_i++) {
+      if (meta_i == CONNECTION_LIMIT || (meta_array[meta_i] != NULL && (send_addr->sin_addr.s_addr == meta_array[meta_i]->send_addr.sin_addr.s_addr) &&
+	      (meta_array[meta_i]->buf_complete != LISTEN)))
+        return;
       if (meta_array[meta_i] == NULL) {
         meta_array[meta_i] = malloc(sizeof(connect_meta));
         break;
       }
-      else if (meta_i == CONNECTION_LIMIT - 1)
-        return;
+    }
     meta_array[meta_i]->udp_socket = sock_fd;
-	meta_array[meta_i]->ack_socket = socket(AF_INET, SOCK_DGRAM, 0);
-	meta_array[meta_i]->send_addr.sin_family = AF_INET;
+    meta_array[meta_i]->ack_socket = socket(AF_INET, SOCK_DGRAM, 0);
+    meta_array[meta_i]->send_addr.sin_family = AF_INET;
     meta_array[meta_i]->send_addr.sin_addr.s_addr = send_addr->sin_addr.s_addr;
     meta_array[meta_i]->send_addr.sin_port = htons(ACK_PORT); //we're gonna respond on a different port
     meta_array[meta_i]->frame_base = packet->header.sequence_num + packet->header.length;
@@ -332,19 +348,6 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 		pthread_mutex_unlock(&meta_array[listen_meta_i]->buf_mutex);
 	  }
 	}
-
-    /* ACK SEQ segment */
-    response = malloc(sizeof(h_packet));
-    response->header.sequence_num = packet->header.sequence_num + packet->header.length;
-    response->header.length = sizeof(m_header);
-    response->header.SEQ = 1;
-    response->header.ACK = 1;
-    response->header.FIN = 0;
-    
-    pth_arg = malloc(sizeof(struct pth_sp_arg));
-    pth_arg->meta_i = meta_i;
-    pth_arg->packet = response;
-    pthread_create(&thr, 0, pth_send_packet, pth_arg);
 
     return;
   }
@@ -369,6 +372,8 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 
   /* If this is an ACK segment */
   if (packet->header.ACK) {
+    if (packet->header.FIN)
+      meta->buf_complete = COMPLETE;
     /* New ACK */
     if (packet->header.sequence_num > meta->frame_base) {
 
@@ -644,7 +649,8 @@ void finish_sr(void)
 {
   while(1) {
     for (int i = 0; i < CONNECTION_LIMIT; i++) {
-	  if (meta_array[i] != NULL && meta_array[i]->buf_end != meta_array[i]->buf_start)
+	  if (meta_array[i] != NULL && (meta_array[i]->buf_complete == COMPLETE || 
+          meta_array[i]->buf_complete == LISTEN))
 		break;
 	  else if (i == CONNECTION_LIMIT - 1)
 		goto THREADS;
