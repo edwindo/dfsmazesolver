@@ -274,7 +274,10 @@ void* pth_send_packet(void* arg)
     meta = meta_array[packet_arg->meta_i];
     if (meta == NULL || meta->frame_base > packet_arg->packet->header.sequence_num ||
 	    packet_arg->packet->header.ACK)
+    {
       break;
+    }
+    printf("PACKET LOST FAGGOT\n");
   }
   /* If this is the FIN (not ACK)packet, delete the metadata structure */
   if (packet_arg->packet->header.FIN && !packet_arg->packet->header.ACK) {
