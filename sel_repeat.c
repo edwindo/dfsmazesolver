@@ -68,6 +68,7 @@ typedef struct connect_metadata {
 
   /* Buffer variables */
   pthread_mutex_t buf_mutex;
+  time_t last_pack; //Used by server only to determine last acked packet
   int8_t  buf_complete;
   uint16_t buf_start;
   uint16_t buf_end;
@@ -142,7 +143,8 @@ int connect_rdt(char* hostname)
   bind(meta->ack_socket, (struct sockaddr*)ack_addr,
        sizeof(struct sockaddr_in));
 
-  meta->frame_base = -1;
+  meta->last_pack = 0;
+  meta->frame_base = 0;
   meta->acked_bmap = 0;
   meta->sent_bmap = 0;
 
@@ -246,6 +248,7 @@ void* pth_send_packet(void* arg)
   pthread_detach(pthread_self());
   struct pth_sp_arg* packet_arg;
   connect_meta* meta;
+  int packet_offset;
   note_thread_id(pthread_self());
   packet_arg = (struct pth_sp_arg*)arg;
   meta = meta_array[packet_arg->meta_i];
@@ -272,18 +275,14 @@ void* pth_send_packet(void* arg)
 	
     usleep(RT_TIMEOUT*1000);
     meta = meta_array[packet_arg->meta_i];
+    packet_offset = (packet_arg->packet->header.sequence_num - meta->frame_base) / PACK_LEN;
     if (meta == NULL || meta->frame_base > packet_arg->packet->header.sequence_num ||
-	    packet_arg->packet->header.ACK)
-    {
+	    (meta->acked_bmap & (1 << packet_offset)) || packet_arg->packet->header.ACK)
       break;
-    }
-    printf("PACKET LOST FAGGOT\n");
+
+    printf("PACKET LOST FAGGOT--FRAME BASE: %d ACKED BMAP: %02x OFFSET: %d\n", meta->frame_base, meta->acked_bmap, packet_offset);
   }
-  /* If this is the FIN (not ACK)packet, delete the metadata structure */
-  if (packet_arg->packet->header.FIN && !packet_arg->packet->header.ACK) {
-    meta_array[packet_arg->meta_i] = NULL;
-    free(meta);
-  }
+  printf("%d IT OUT BOYS--FRAME BASE: %d ACKED BMAP: %02x OFFSET: %d\n", packet_arg->packet->header.sequence_num, meta->frame_base, meta->acked_bmap, packet_offset);
   remove_thread_id(pthread_self());
   free(packet_arg->packet);
   free(packet_arg);
@@ -372,7 +371,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     return;
 
   /* Number of packets ahead */
-  packet_offset = (packet->header.sequence_num - meta->frame_base) / PACK_LEN - 1;
+  packet_offset = (packet->header.sequence_num - meta->frame_base) / PACK_LEN;
 
   /* If this is an ACK segment */
   if (packet->header.ACK) {
@@ -380,17 +379,20 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
       meta->buf_complete = FIN_BUF;
     /* New ACK */
     if (packet->header.sequence_num > meta->frame_base) {
-
-	  meta->acked_bmap |= (1 << packet_offset);
-	  if (packet_offset <= 0) {
+      if ((packet->header.sequence_num - meta->frame_base) % PACK_LEN != 0 && !packet->header.SEQ) //less than PACK_LEN packet
+        packet_offset++;
+	  if (packet_offset <= 1) {
 		meta->acked_bmap >>= 1;
 		meta->sent_bmap >>= 1;
 		meta->frame_base = packet->header.sequence_num;
 	  }
+      else
+        meta->acked_bmap |= (1 << (packet_offset - 1));
 	  while (meta->acked_bmap & 0x01) {
+        printf("ACKED BMAP MY GUY: %02x\n", meta->acked_bmap);
 	    meta->acked_bmap >>= 1;
 		meta->sent_bmap >>= 1;
-		meta->frame_base += BUF_SIZE;
+		meta->frame_base += PACK_LEN;
 	  }
 
       /* Start sending data packets */
@@ -439,6 +441,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 
   /* If this is a data packet */
   else {   
+    meta->last_pack = time(NULL); // Mark for finish_sr
     pthread_mutex_lock(&meta->buf_mutex);
     /* Copy packet data into circular buffer */
     for (int i = 0; i < packet->header.length - sizeof(m_header); i++) {
@@ -456,8 +459,9 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 	}
  
     /* Mark buffer complete if this is a FIN packet */
-    if (packet->header.FIN)
+    if (packet->header.FIN) {
       meta->buf_complete = FIN_BUF;
+    }
 
     /* Add segment to acked_bmap */
     meta->acked_bmap |= (1 << packet_offset);
@@ -465,8 +469,8 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     /* Update buf_end for continuous data segments */
     while (meta->acked_bmap & 1) {
       meta->acked_bmap >>= 1;
-      if (meta->acked_bmap) {
-        meta->buf_end = (meta->buf_end + PACK_LEN - sizeof(m_header)) % BUF_SIZE;
+      if (packet_offset) {
+        meta->buf_end = (meta->buf_end + DATA_LEN) % BUF_SIZE;
         meta->frame_base += PACK_LEN;
       }
       else {
@@ -532,7 +536,7 @@ int read_sr(int meta_i, void *buf, unsigned int nbyte)
   char* c_buf = (char*)buf;
   int length = (end - start) % BUF_SIZE;
 
-  if (length == 0 && (meta->buf_complete == COMPLETE)) {
+  if (length == 0 && (meta->buf_complete == FIN_BUF)) {
     pthread_mutex_unlock(&meta->buf_mutex);
     return -1;
   }
@@ -652,12 +656,18 @@ int remove_thread_id(pthread_t thr)
 void finish_sr(void)
 {
   while(1) {
-    for (int i = 0; i < CONNECTION_LIMIT; i++) {
-	  if (meta_array[i] != NULL && meta_array[i]->buf_complete != FIN_BUF && 
-          meta_array[i]->buf_complete != LISTEN)
-		break;
-	  else if (i == CONNECTION_LIMIT - 1)
-		goto THREADS;
+    for (int i = 0; i <= CONNECTION_LIMIT; i++) {
+      if (i == CONNECTION_LIMIT)
+        goto THREADS;
+      else if (meta_array[i] == NULL || meta_array[i]->buf_complete == LISTEN)
+        continue;
+      else if (meta_array[i]->buf_complete == FIN_BUF) {
+        time_t current_time = time(NULL);
+        if (current_time - meta_array[i]->last_pack < RT_TIMEOUT / 100)
+          break;
+      }
+	  else
+        break;
 	}
     sched_yield();
   }
