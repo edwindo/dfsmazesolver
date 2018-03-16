@@ -69,6 +69,7 @@ typedef struct connect_metadata {
   /* Buffer variables */
   pthread_mutex_t buf_mutex;
   time_t last_pack; //Used by server only to determine last acked packet
+  int16_t fin_length;
   int8_t  buf_complete;
   uint16_t buf_start;
   uint16_t buf_end;
@@ -306,6 +307,20 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 
   /* If this is the initial SEQ packet */
   if (packet->header.SEQ && !packet->header.ACK) {
+    /* Allocate meta_array */
+    for (meta_i = 0; ; meta_i++) {
+      if (meta_i == CONNECTION_LIMIT || (meta_array[meta_i] != NULL && (send_addr->sin_addr.s_addr == meta_array[meta_i]->send_addr.sin_addr.s_addr) &&
+	      (meta_array[meta_i]->buf_complete != LISTEN))) {
+        int sequence = packet->header.sequence_num + packet->header.length;
+        pth_arg = make_pack_arg(meta_i, sequence, HEADER_LEN, 1, 0, 1);
+        pthread_create(&thr, 0, pth_send_packet, pth_arg);
+        return;
+      }
+      if (meta_array[meta_i] == NULL) {
+        meta_array[meta_i] = malloc(sizeof(connect_meta));
+        break;
+      }
+    }
     /* ACK SEQ segment */
     response = malloc(sizeof(h_packet));
     response->header.sequence_num = packet->header.sequence_num + packet->header.length;
@@ -319,16 +334,6 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     pth_arg->packet = response;
     pthread_create(&thr, 0, pth_send_packet, pth_arg);
 
-    /* Allocate meta_array */
-    for (meta_i = 0; ; meta_i++) {
-      if (meta_i == CONNECTION_LIMIT || (meta_array[meta_i] != NULL && (send_addr->sin_addr.s_addr == meta_array[meta_i]->send_addr.sin_addr.s_addr) &&
-	      (meta_array[meta_i]->buf_complete != LISTEN)))
-        return;
-      if (meta_array[meta_i] == NULL) {
-        meta_array[meta_i] = malloc(sizeof(connect_meta));
-        break;
-      }
-    }
     meta_array[meta_i]->udp_socket = sock_fd;
     meta_array[meta_i]->ack_socket = socket(AF_INET, SOCK_DGRAM, 0);
     meta_array[meta_i]->send_addr.sin_family = AF_INET;
@@ -338,6 +343,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     meta_array[meta_i]->acked_bmap = 0;
     pthread_mutex_init(&meta_array[meta_i]->buf_mutex, NULL);
     pthread_mutex_lock(&meta_array[meta_i]->buf_mutex);
+    meta_array[meta_i]->fin_length = -1;
     meta_array[meta_i]->buf_start = 0;
     meta_array[meta_i]->buf_end = 0;
 	meta_array[meta_i]->buf_complete = SENDING;
@@ -439,28 +445,25 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     }
   }
 
-  /* If this is a data packet */
-  else {   
+  /* If this is a new data packet */
+  else if (packet_offset >= 0) {   
     meta->last_pack = time(NULL); // Mark for finish_sr
     pthread_mutex_lock(&meta->buf_mutex);
     /* Copy packet data into circular buffer */
     for (int i = 0; i < packet->header.length - sizeof(m_header); i++) {
       /* If the buffer is too small for the data */
-      if ((meta->buf_end + i + 1) % BUF_SIZE == meta->buf_start) {
+      int start = (packet_offset*DATA_LEN + meta->buf_end) % BUF_SIZE;
+      if ((start + i + 1) % BUF_SIZE == meta->buf_start) {
 		pthread_mutex_unlock(&meta->buf_mutex);
         return;
 	  }
-      meta->buffer[(meta->buf_end + i) % BUF_SIZE] = packet->data[i];
+      meta->buffer[(start + i) % BUF_SIZE] = packet->data[i];
     }
-	if (packet->header.sequence_num == meta->frame_base) {
-	  meta->buf_end += packet->header.length - sizeof(m_header);
-	  meta->buf_end %= BUF_SIZE;
-  	  meta->acked_bmap >>= 1;
-	}
  
     /* Mark buffer complete if this is a FIN packet */
     if (packet->header.FIN) {
       meta->buf_complete = FIN_BUF;
+      meta->fin_length = packet->header.length;
     }
 
     /* Add segment to acked_bmap */
@@ -469,19 +472,26 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     /* Update buf_end for continuous data segments */
     while (meta->acked_bmap & 1) {
       meta->acked_bmap >>= 1;
-      if (packet_offset) {
-        meta->buf_end = (meta->buf_end + DATA_LEN) % BUF_SIZE;
-        meta->frame_base += PACK_LEN;
+      if (!meta->acked_bmap && meta->fin_length > 0) {// Increment differently for last packet
+        meta->frame_base += meta->fin_length;
+        meta->buf_end = (meta->buf_end + meta->fin_length - HEADER_LEN) % BUF_SIZE;
       }
       else {
-        meta->buf_end = (meta->buf_end + packet->header.length - sizeof(m_header)) % BUF_SIZE;
-        meta->frame_base += packet->header.length;
+        meta->buf_end = (meta->buf_end + DATA_LEN) % BUF_SIZE;
+        meta->frame_base += PACK_LEN;
       }
     }
     pthread_mutex_unlock(&meta->buf_mutex);
     /* Send individual ACK */
 	int sequence = packet->header.sequence_num + packet->header.length;
 	pth_arg = make_pack_arg(meta_i, sequence, HEADER_LEN, 0, packet->header.FIN, 1);
+    pthread_create(&thr, 0, pth_send_packet, pth_arg);
+  }
+  /* Old data packet, just send the ACK */
+  else { 
+    meta->last_pack = time(NULL); // Mark for finish_sr
+    int sequence = packet->header.sequence_num + packet->header.length;
+    pth_arg = make_pack_arg(meta_i, sequence, HEADER_LEN, 0, packet->header.FIN, 1);
     pthread_create(&thr, 0, pth_send_packet, pth_arg);
   }
   return;

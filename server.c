@@ -7,16 +7,23 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include "sel_repeat.h"
 
 int main(int argc, char* argv[]) {
+  if (argc > 2) {
+    printf("Requires at most 1 argument: File extension (e.g. '.jpg'\n");
+    exit(1);
+  }
   int meta_i = init_serv("");
   init_summary();
-  char buf[256];
-  int fd = open("output.txt", O_CREAT | O_RDWR);
+  char buf[256] = "output";
+  if (argc == 2) 
+    strcat(buf, argv[1]);
+  int fd = open(buf, O_CREAT | O_RDWR);
   if (fd < 0) {
     printf("Could not open output file\n");
     exit(1);
