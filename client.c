@@ -23,11 +23,16 @@ int main(int argc, char* argv[]) {
   init_summary();
   signal(SIGINT, handle_sig);
   int fd = open(argv[1], O_RDONLY);
+  if (fd < 0) {
+    printf("Invalid file\n");
+    exit(1);
+  }
   int meta_i = connect_rdt("127.0.0.1");
   char buf[256];
   int nchars;
-  while ((nchars = read(fd, buf, 256)) > 0)
-    write_sr(meta_i, buf, 256);
+  while ((nchars = read(fd, buf, 256)) > 0) {
+    nchars = write_sr(meta_i, buf, 256);
+  }
   mark_done(meta_i);
   finish_sr();
   print_summary();
