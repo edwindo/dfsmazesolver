@@ -280,8 +280,25 @@ void* pth_send_packet(void* arg)
   note_thread_id(pthread_self(), arg);
   packet_arg = (struct pth_sp_arg*)arg;
   meta = meta_array[packet_arg->meta_i];
+  /* Print Sending packet... */
+  if (CON_CTRL) {
+    if (packet_arg->packet->header.SEQ)
+      printf("Sending packet %d %d %d SYN\n", packet_arg->packet->header.sequence_num, meta->cwindow, meta->ssthresh);
+    else if (packet_arg->packet->header.FIN)
+      printf("Sending packet %d %d %d FIN\n", packet_arg->packet->header.sequence_num, meta->cwindow, meta->ssthresh);
+    else
+      printf("Sending packet %d %d %d\n", packet_arg->packet->header.sequence_num, meta->cwindow, meta->ssthresh);
+  }
+  else {
+    if (packet_arg->packet->header.SEQ)
+      printf("Sending packet %d %d SYN\n", packet_arg->packet->header.sequence_num, meta->cwindow);
+    else if (packet_arg->packet->header.FIN)
+      printf("Sending packet %d %d FIN\n", packet_arg->packet->header.sequence_num, meta->cwindow);
+    else
+      printf("Sending packet %d %d\n", packet_arg->packet->header.sequence_num, meta->cwindow);
+  }
   while (1) {
-	print_meta_data(meta, packet_arg->meta_i);
+	//print_meta_data(meta, packet_arg->meta_i);
     /* Direct ACK packets to ack_socket */
     if (packet_arg->packet->header.ACK) {
       sendto(meta->ack_socket, packet_arg->packet, packet_arg->packet->header.length,
@@ -293,7 +310,7 @@ void* pth_send_packet(void* arg)
              0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
       getsockname(meta->udp_socket, (struct sockaddr*)&sockadd, &sock_len);
 	}
-    printf("PORTNO: %d\n", ntohs(sockadd.sin_port));
+    //printf("PORTNO: %d\n", ntohs(sockadd.sin_port));
     if (packet_sum) {
       packet_arg->packet->header.SENT = 1;
       add_to_sum(packet_arg->packet->header, meta->cwindow, meta->ssthresh);
@@ -302,7 +319,7 @@ void* pth_send_packet(void* arg)
 	int hostlen = 32;
 	getnameinfo((struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in),
 	            host, hostlen, NULL, 0, 0);
-	print_packet_data(packet_arg->packet);
+	//print_packet_data(packet_arg->packet);
 	
     usleep(RT_TIMEOUT*1000);
     meta = meta_array[packet_arg->meta_i];
@@ -316,9 +333,25 @@ void* pth_send_packet(void* arg)
         meta->ssthresh = PACK_LEN;
       meta->cwindow = INITIAL_CW;
     }
-    printf("PACKET LOST FAGGOT--FRAME BASE: %d ACKED BMAP: %02x OFFSET: %d\n", meta->frame_base, meta->acked_bmap, packet_offset);
+    if (CON_CTRL) { 
+      if (packet_arg->packet->header.SEQ)
+        printf("Sending packet %d %d %d Retransmission SYN\n", packet_arg->packet->header.sequence_num, meta->cwindow, meta->ssthresh);
+      else if (packet_arg->packet->header.FIN)
+        printf("Sending packet %d %d %d Retransmission FIN\n", packet_arg->packet->header.sequence_num, meta->cwindow, meta->ssthresh);
+      else
+        printf("Sending packet %d %d %d Retransmission\n", packet_arg->packet->header.sequence_num, meta->cwindow, meta->ssthresh);
+    }
+    else {
+      if (packet_arg->packet->header.SEQ)
+        printf("Sending packet %d %d Retransmission SYN\n", packet_arg->packet->header.sequence_num, meta->cwindow);
+      else if (packet_arg->packet->header.FIN)
+        printf("Sending packet %d %d Retransmission FIN\n", packet_arg->packet->header.sequence_num, meta->cwindow);
+      else
+        printf("Sending packet %d %d Retransmission\n", packet_arg->packet->header.sequence_num, meta->cwindow);
+    }
+   
   }
-  printf("%d IT OUT BOYS--FRAME BASE: %d ACKED BMAP: %02x OFFSET: %d\n", packet_arg->packet->header.sequence_num, meta->frame_base, meta->acked_bmap, packet_offset);
+  //printf("%d IT OUT BOYS--FRAME BASE: %d ACKED BMAP: %02x OFFSET: %d\n", packet_arg->packet->header.sequence_num, meta->frame_base, meta->acked_bmap, packet_offset);
   remove_thread_id(pthread_self());
   free(packet_arg->packet);
   free(packet_arg);
@@ -331,14 +364,13 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     packet->header.SENT = 0;
     add_to_sum(packet->header, meta_array[0]->cwindow, meta_array[0]->ssthresh);
   }
-  print_packet_data(packet); //DEBUG
+  printf("Receiving packet %d\n", packet->header.sequence_num);
+  //print_packet_data(packet); //DEBUG
   /* Local variables */
   int meta_i, listen_meta_i, packet_offset;
   h_packet* response;
   struct pth_sp_arg* pth_arg;
   pthread_t thr;
-
-  //getnameinfo((struct sockaddr*)serv_addr, sizeof(serv_addr), hbuf, sizeof(hbuf), NULL, 0, NI_NUMERICHOST);
 
   /* If this is the initial SEQ packet */
   if (packet->header.SEQ && !packet->header.ACK) {
@@ -382,6 +414,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     meta_array[meta_i]->frame_base = packet->header.sequence_num + packet->header.length;
     meta_array[meta_i]->acked_bmap = 0;
     meta_array[meta_i]->cwindow = WIN_SIZE;
+    meta_array[meta_i]->ssthresh = INITIAL_SS;
     pthread_mutex_init(&meta_array[meta_i]->buf_mutex, NULL);
     pthread_mutex_lock(&meta_array[meta_i]->buf_mutex);
     meta_array[meta_i]->fin_length = -1;

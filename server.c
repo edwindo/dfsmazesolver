@@ -21,9 +21,9 @@ int main(int argc, char* argv[]) {
     printf("Error, expecting exactly one argument: portno\n");
     exit(1);
   }
-  signal(SIGINT, handle_sig);
+  //signal(SIGINT, handle_sig);
   int meta_i = init_serv("", atoi(argv[1]));
-  init_summary();
+  //init_summary();
   int nbyte;
   int connect;
   char buf[256];
@@ -54,9 +54,8 @@ int main(int argc, char* argv[]) {
     }
   mark_done(send_connect);
 
-  printf("\n");
   finish_sr();
-  print_summary();
+  //print_summary();
   printf("\nEnd of transmission\n");
 }
 

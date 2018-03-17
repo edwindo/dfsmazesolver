@@ -21,18 +21,17 @@ int main(int argc, char* argv[]) {
     printf("Three command line arguments: hostname portno filename\n");
     exit(1);
   }
-  init_summary();
-  signal(SIGINT, handle_sig);
+  //init_summary();
+  //signal(SIGINT, handle_sig);
   int meta_i = connect_rdt(argv[1], atoi(argv[2]));
   write_sr(meta_i, argv[3], strlen(argv[3]));
   mark_done(meta_i);
   finish_sr();
   int server = init_serv("127.0.0.1", 23135);
-  printf("WHATS GOING ONE\n");
   int connect = await_connection(server);
   int nbytes;
   char buf[256];
-  int fd = open("received.data", O_CREAT | O_RDWR);
+  int fd = open("received.data", O_CREAT | O_RDWR | O_TRUNC);
   if (fd < 0) {
     printf("Error opening file\n");
     exit(1);
@@ -40,7 +39,7 @@ int main(int argc, char* argv[]) {
   while ((nbytes = read_sr(connect, buf, 256)) >= 0)
     write(fd, buf, nbytes);
   finish_sr();
-  print_summary();
+  //print_summary();
 }
 
 void handle_sig(int arg)
