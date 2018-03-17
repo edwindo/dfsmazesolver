@@ -6,12 +6,16 @@
 ################################
 .SILENT:
 build:
-	gcc -std=gnu99 -pthread -o client client.c sel_repeat.c
-	gcc -std=gnu99 -pthread -o server server.c sel_repeat.c
+	gcc -D CON_CTRL=0 -std=gnu99 -pthread -o client client.c sel_repeat.c
+	gcc -D CON_CTRL=0 -std=gnu99 -pthread -o server server.c sel_repeat.c
+
+congest:
+	gcc -D CON_CTRL=1 -std=gnu99 -pthread -o client_c client.c sel_repeat.c
+	gcc -D CON_CTRL=1 -std=gnu99 -pthread -o server_c server.c sel_repeat.c
 
 gdb:
-	gcc -g -std=gnu99 -pthread -o client_d client.c sel_repeat.c
-	gcc -g -std=gnu99 -pthread -o server_d server.c sel_repeat.c
+	gcc -D CON_CTRL=0 -g -std=gnu99 -pthread -o client_d client.c sel_repeat.c
+	gcc -D CON_CTRL=0 -g -std=gnu99 -pthread -o server_d server.c sel_repeat.c
 
 clean:
 	rm -f server client server_d client_d

@@ -23,9 +23,9 @@
 #include <sched.h>
 #include <errno.h>
 
-#define BUF_SIZE (16*(PACK_LEN - sizeof(m_header)) + 1)
 #define DATA_LEN (PACK_LEN - sizeof(m_header))
 #define HEADER_LEN sizeof(m_header)
+#define BUF_SIZE (128*DATA_LEN)
 #define CONNECTION_LIMIT 8
 #define THREAD_LIMIT 20
 
@@ -39,6 +39,10 @@
 /* Port definitions */
 #define PORT     13013
 #define ACK_PORT 13018
+
+/* Window definitions */
+#define INITIAL_SS 15360
+#define INITIAL_CW 1024
 
 typedef struct mikes_header {
   int16_t sequence_num;
@@ -63,8 +67,10 @@ typedef struct connect_metadata {
 
   /* Window variables */
   volatile int16_t frame_base;
-  volatile uint8_t  acked_bmap; // LSB = current packet, MSB = later packet
-  volatile uint8_t  sent_bmap;
+  volatile uint8_t acked_bmap; // LSB = current packet, MSB = later packet
+  volatile uint8_t sent_bmap;
+  volatile int32_t ssthresh;
+  volatile int32_t cwindow;
 
   /* Buffer variables */
   pthread_mutex_t buf_mutex;
@@ -87,7 +93,7 @@ int fetch_packets(int udp_socket);
 int read_sr(int meta_i, void *buf, unsigned int nbyte);
 int write_sr(int meta_i, void *buf, unsigned int count);
 void mark_done(int meta_i);
-int note_thread_id(pthread_t thr);
+int note_thread_id(pthread_t thr, void* packet);
 int remove_thread_id(pthread_t thr);
 void* pth_maintain_pipe(void* arg);
 void finish_sr(void);
@@ -95,19 +101,23 @@ void print_packet_data(h_packet* packet);
 void print_meta_data(connect_meta* meta, int meta_i);
 void init_summary(void);
 void print_summary(void);
-void add_to_sum(m_header header);
+void add_to_sum(m_header header, int cwind, int ssthresh);
+void fast_retransmit(int meta_i, int sequence_num);
+void check_missed_acks(int meta_i);
 
 /* Global variables */
 connect_meta* meta_array[CONNECTION_LIMIT] = {0, 0, 0, 0, 0, 0, 0, 0};
 pthread_t thread_id_array[THREAD_LIMIT];
+void* thread_arg_array[THREAD_LIMIT];
 uint32_t thread_bitmap = 0;
 pthread_mutex_t thread_mutex;
 uint8_t pipe_maintainer_thread = 0;
 m_header* packet_sum = NULL;
+int* cwind_sum = NULL;
+int* ssthresh_sum = NULL;
 pthread_mutex_t sum_mutex;
 int sum_elements = 0;
 int sum_size = 0;
-
 
 int connect_rdt(char* hostname)
 {
@@ -148,6 +158,8 @@ int connect_rdt(char* hostname)
   meta->frame_base = 0;
   meta->acked_bmap = 0;
   meta->sent_bmap = 0;
+  meta->ssthresh = INITIAL_SS;
+  meta->cwindow = CON_CTRL ? INITIAL_CW : WIN_SIZE;
 
   pthread_mutex_init(&meta->buf_mutex, NULL);
   pthread_mutex_lock(&meta->buf_mutex);
@@ -250,7 +262,7 @@ void* pth_send_packet(void* arg)
   struct pth_sp_arg* packet_arg;
   connect_meta* meta;
   int packet_offset;
-  note_thread_id(pthread_self());
+  note_thread_id(pthread_self(), arg);
   packet_arg = (struct pth_sp_arg*)arg;
   meta = meta_array[packet_arg->meta_i];
   while (1) {
@@ -266,7 +278,7 @@ void* pth_send_packet(void* arg)
 	}
     if (packet_sum) {
       packet_arg->packet->header.SENT = 1;
-      add_to_sum(packet_arg->packet->header);
+      add_to_sum(packet_arg->packet->header, meta->cwindow, meta->ssthresh);
     }
 	char host[32];
 	int hostlen = 32;
@@ -280,7 +292,10 @@ void* pth_send_packet(void* arg)
     if (meta == NULL || meta->frame_base > packet_arg->packet->header.sequence_num ||
 	    (meta->acked_bmap & (1 << packet_offset)) || packet_arg->packet->header.ACK)
       break;
-
+    if (CON_CTRL) {
+      meta->ssthresh = meta->cwindow / 2;
+      meta->cwindow = INITIAL_CW;
+    }
     printf("PACKET LOST FAGGOT--FRAME BASE: %d ACKED BMAP: %02x OFFSET: %d\n", meta->frame_base, meta->acked_bmap, packet_offset);
   }
   printf("%d IT OUT BOYS--FRAME BASE: %d ACKED BMAP: %02x OFFSET: %d\n", packet_arg->packet->header.sequence_num, meta->frame_base, meta->acked_bmap, packet_offset);
@@ -294,7 +309,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 {
   if (packet_sum) {
     packet->header.SENT = 0;
-    add_to_sum(packet->header);
+    add_to_sum(packet->header, meta_array[0]->cwindow, meta_array[0]->ssthresh);
   }
   print_packet_data(packet); //DEBUG
   /* Local variables */
@@ -341,6 +356,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     meta_array[meta_i]->send_addr.sin_port = htons(ACK_PORT); //we're gonna respond on a different port
     meta_array[meta_i]->frame_base = packet->header.sequence_num + packet->header.length;
     meta_array[meta_i]->acked_bmap = 0;
+    meta_array[meta_i]->cwindow = WIN_SIZE;
     pthread_mutex_init(&meta_array[meta_i]->buf_mutex, NULL);
     pthread_mutex_lock(&meta_array[meta_i]->buf_mutex);
     meta_array[meta_i]->fin_length = -1;
@@ -357,7 +373,6 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 		pthread_mutex_unlock(&meta_array[listen_meta_i]->buf_mutex);
 	  }
 	}
-
     return;
   }
 
@@ -373,7 +388,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
   //print_meta_data(meta, meta_i); //DEBUG
 
   /* If packet is out of window region */
-  if (packet->header.sequence_num > meta->frame_base + WIN_SIZE - PACK_LEN)
+  if (packet->header.sequence_num > meta->frame_base + meta->cwindow)
     return;
 
   /* Number of packets ahead */
@@ -384,9 +399,23 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     if (packet->header.FIN)
       meta->buf_complete = FIN_BUF;
     /* New ACK */
+    
     if (packet->header.sequence_num > meta->frame_base) {
       if ((packet->header.sequence_num - meta->frame_base) % PACK_LEN != 0 && !packet->header.SEQ) //less than PACK_LEN packet
         packet_offset++;
+      /* Modify congestion window */
+      int c_packs = meta->cwindow / PACK_LEN;
+      if (CON_CTRL && !(meta->acked_bmap & (1 << packet_offset))) {
+        if (meta->cwindow < meta->ssthresh) {
+          meta->cwindow += PACK_LEN;
+        }
+        else {
+          meta->cwindow += PACK_LEN / c_packs;
+          if (PACK_LEN - meta->cwindow % PACK_LEN < PACK_LEN / c_packs)
+            meta->cwindow += PACK_LEN - meta->cwindow % PACK_LEN;
+        }
+      }
+
 	  if (packet_offset <= 1) {
 		meta->acked_bmap >>= 1;
 		meta->sent_bmap >>= 1;
@@ -401,8 +430,11 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 		meta->frame_base += PACK_LEN;
 	  }
 
+      if (CON_CTRL)
+        check_missed_acks(meta_i);
+
       /* Start sending data packets */
-      for (int i = 0; i < WIN_SIZE / PACK_LEN; i++) {
+      for (int i = 0; i < c_packs; i++) {
         pthread_mutex_lock(&meta->buf_mutex);
 		/* If this packet has already been sent */
 		if (meta->sent_bmap & (1 << i)) {
@@ -628,13 +660,14 @@ void mark_done(int meta_i)
 
 
 
-int note_thread_id(pthread_t thr)
+int note_thread_id(pthread_t thr, void* packet)
 {
   pthread_mutex_lock(&thread_mutex);
   uint32_t mask = 1;
   for (int i = 0; i < THREAD_LIMIT; i++) {
     if ((thread_bitmap & mask) == 0) {
       thread_id_array[i] = thr;
+      thread_arg_array[i] = packet;
       thread_bitmap |= mask;
 	  pthread_mutex_unlock(&thread_mutex);
       return i;
@@ -723,6 +756,7 @@ void print_meta_data(connect_meta* meta, int meta_i)
     strcpy(string, "FIN");
   printf("Buf complete: %s\n", string);
   printf("Buf start: %d\n Buf end: %d\n", meta->buf_start, meta->buf_end);
+  printf("CWINDOW: %d SSTHRESH: %d\n", meta->cwindow, meta->ssthresh);
 }
 
 void init_summary(void)
@@ -730,6 +764,8 @@ void init_summary(void)
   pthread_mutex_init(&sum_mutex, 0);
   pthread_mutex_lock(&sum_mutex);
   packet_sum = malloc(50*sizeof(m_header));
+  cwind_sum = malloc(50*sizeof(int));
+  ssthresh_sum = malloc(50*sizeof(int));
   sum_size = 50;
   pthread_mutex_unlock(&sum_mutex);
 }
@@ -737,25 +773,69 @@ void init_summary(void)
 void print_summary(void)
 {
   pthread_mutex_lock(&sum_mutex);
-  printf("SENT/RECEIVED  NO ACK SYN FIN LENGTH\n");
+  printf("SENT/RECEIVED  NO ACK SYN FIN LENGTH CWIND SSTHRESH\n");
   for (int i = 0; i < sum_elements; i++) {
     if (packet_sum[i].SENT == 0)
-      printf("RECEIVED %8d   %1d   %1d   %1d   %4d\n", packet_sum[i].sequence_num, 
-             packet_sum[i].ACK, packet_sum[i].SEQ, packet_sum[i].FIN, packet_sum[i].length);
+      printf("RECEIVED %8d   %1d   %1d   %1d   %4d %5d   %6d\n", packet_sum[i].sequence_num, 
+             packet_sum[i].ACK, packet_sum[i].SEQ, packet_sum[i].FIN, packet_sum[i].length, cwind_sum[i], ssthresh_sum[i]);
     else
-      printf("SENT     %8d   %1d   %1d   %1d   %4d\n", packet_sum[i].sequence_num, 
-             packet_sum[i].ACK, packet_sum[i].SEQ, packet_sum[i].FIN, packet_sum[i].length);
+      printf("SENT     %8d   %1d   %1d   %1d   %4d %5d   %6d\n", packet_sum[i].sequence_num, 
+             packet_sum[i].ACK, packet_sum[i].SEQ, packet_sum[i].FIN, packet_sum[i].length, cwind_sum[i], ssthresh_sum[i]);
   }
   pthread_mutex_unlock(&sum_mutex);
 }
 
-void add_to_sum(m_header header)
+void add_to_sum(m_header header, int cwind, int ssthresh)
 {
   pthread_mutex_lock(&sum_mutex);
   if (sum_elements == sum_size) {
     sum_size += 50;
-    packet_sum = realloc(packet_sum, sum_size);
+    packet_sum = realloc(packet_sum, sum_size*sizeof(m_header));
+    cwind_sum = realloc(cwind_sum, sum_size*sizeof(int));
+    ssthresh_sum = realloc(ssthresh_sum, sum_size*sizeof(int));
   }
-  packet_sum[sum_elements++] = header;
+  packet_sum[sum_elements] = header;
+  cwind_sum[sum_elements] = cwind;
+  ssthresh_sum[sum_elements++] = ssthresh;
   pthread_mutex_unlock(&sum_mutex);
+}
+
+void fast_retransmit(int meta_i, int sequence_num)
+{
+  connect_meta* meta = meta_array[meta_i];
+  for (int i = 0; i < THREAD_LIMIT; i++) {
+    struct pth_sp_arg* arg = (struct pth_sp_arg*)thread_arg_array[i];
+    if (thread_bitmap & (1 << i) && arg->meta_i == meta_i && 
+        arg->packet->header.sequence_num == sequence_num)
+      sendto(meta->udp_socket, arg->packet, arg->packet->header.length,
+             0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
+  }
+}
+
+void check_missed_acks(int meta_i)
+{
+  connect_meta* meta = meta_array[meta_i];
+  int bitcount = 0;
+  for (int i = 0; i < 32; i++)
+    if (meta->acked_bmap & (1 << i))
+      bitcount++;
+  for (int i = 0; i < 32; i++) {
+    if (meta->acked_bmap & (1 << i)) {
+      bitcount--;
+    }
+    else {
+      if (bitcount >= 3) {
+        /* Fast recovery */
+        if (meta->cwindow > 2*PACK_LEN) {
+          meta->cwindow /= 2;
+          meta->ssthresh = meta->cwindow;
+        }
+        else {
+          meta->cwindow = INITIAL_CW;
+          meta->ssthresh = INITIAL_CW;
+        }
+        fast_retransmit(meta_i, meta->frame_base + i*PACK_LEN);
+      }
+    }
+  }
 }

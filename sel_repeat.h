@@ -10,7 +10,7 @@
 
 #define PACK_LEN    1024
 #define MAX_SEQ_NUM 30720
-#define WIN_SIZE    5120
+#define WIN_SIZE    1024
 #define RT_TIMEOUT  500
 
 int init_serv(char* hostname);
