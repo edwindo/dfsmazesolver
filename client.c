@@ -11,29 +11,34 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <string.h>
 #include "sel_repeat.h"
 
 void handle_sig(int arg);
 
 int main(int argc, char* argv[]) {
-  if (argc != 2) {
-    printf("One command line argument: Filename\n");
+  if (argc != 4) {
+    printf("Three command line arguments: hostname portno filename\n");
     exit(1);
   }
   init_summary();
   signal(SIGINT, handle_sig);
-  int fd = open(argv[1], O_RDONLY);
+  int meta_i = connect_rdt(argv[1], atoi(argv[2]));
+  write_sr(meta_i, argv[3], strlen(argv[3]));
+  mark_done(meta_i);
+  finish_sr();
+  int server = init_serv("127.0.0.1", 23135);
+  printf("WHATS GOING ONE\n");
+  int connect = await_connection(server);
+  int nbytes;
+  char buf[256];
+  int fd = open("received.data", O_CREAT | O_RDWR);
   if (fd < 0) {
-    printf("Invalid file\n");
+    printf("Error opening file\n");
     exit(1);
   }
-  int meta_i = connect_rdt("127.0.0.1");
-  char buf[256];
-  int nchars;
-  while ((nchars = read(fd, buf, 256)) > 0) {
-    nchars = write_sr(meta_i, buf, 256);
-  }
-  mark_done(meta_i);
+  while ((nbytes = read_sr(connect, buf, 256)) >= 0)
+    write(fd, buf, nbytes);
   finish_sr();
   print_summary();
 }
