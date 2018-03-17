@@ -24,4 +24,4 @@ clean:
 	rm -f output output.txt
 
 dist:
-	tar -czf project2_004620459_904637634.tar.gz client.c server.c sel_repeat.c sel_repeat.h Makefile
+	tar -czf project2_004620459_904637634.tar.gz client.c server.c sel_repeat.c sel_repeat.h Makefile README report.pdf
