@@ -13,8 +13,8 @@
 #define WIN_SIZE    1024
 #define RT_TIMEOUT  500
 
-int init_serv(char* hostname);
-int connect_rdt(char* hostname);
+int init_serv(char* hostname, unsigned int PORT);
+int connect_rdt(char* hostname, unsigned int PORT);
 int read_sr(int meta_i, void *buf, unsigned int nbyte);
 int write_sr(int meta_i, void *buf, unsigned int count);
 void mark_done(int meta_i);
@@ -22,5 +22,7 @@ void finish_sr(void);
 int await_connection(int meta_i);
 void init_summary(void);
 void print_summary(void);
+char* get_host_name(int meta_i);
+void remove_connect(int meta_i);
 
 #endif

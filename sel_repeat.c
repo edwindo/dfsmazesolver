@@ -22,6 +22,7 @@
 #include <time.h>
 #include <sched.h>
 #include <errno.h>
+#include <signal.h>
 
 #define DATA_LEN (PACK_LEN - sizeof(m_header))
 #define HEADER_LEN sizeof(m_header)
@@ -37,8 +38,8 @@
 #define FIN_BUF  4
 
 /* Port definitions */
-#define PORT     13013
-#define ACK_PORT 13018
+#define ACK_PORT1 23151
+#define ACK_PORT2 23152
 
 /* Window definitions */
 #define INITIAL_SS 15360
@@ -83,8 +84,8 @@ typedef struct connect_metadata {
 } connect_meta;
 
 /* Function prototypes */
-int connect_rdt(char* hostname);
-int init_serv(char* hostname);
+int connect_rdt(char* hostname, unsigned int PORT);
+int init_serv(char* hostname, unsigned int PORT);
 int await_connection(int meta_i);
 struct pth_sp_arg* make_pack_arg(int meta_i, int sequence, int length, int SEQ, int FIN, int ACK);
 void* pth_send_packet(void* arg);
@@ -104,6 +105,8 @@ void print_summary(void);
 void add_to_sum(m_header header, int cwind, int ssthresh);
 void fast_retransmit(int meta_i, int sequence_num);
 void check_missed_acks(int meta_i);
+char* get_host_name(int meta_i);
+void remove_connect(int meta_i);
 
 /* Global variables */
 connect_meta* meta_array[CONNECTION_LIMIT] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -112,14 +115,16 @@ void* thread_arg_array[THREAD_LIMIT];
 uint32_t thread_bitmap = 0;
 pthread_mutex_t thread_mutex;
 uint8_t pipe_maintainer_thread = 0;
+pthread_t pm_thread;
 m_header* packet_sum = NULL;
 int* cwind_sum = NULL;
 int* ssthresh_sum = NULL;
 pthread_mutex_t sum_mutex;
 int sum_elements = 0;
 int sum_size = 0;
+int ack_flag = 0;
 
-int connect_rdt(char* hostname)
+int connect_rdt(char* hostname, unsigned int PORT)
 {
   /* Local variables */
   int meta_i;
@@ -144,7 +149,12 @@ int connect_rdt(char* hostname)
   struct sockaddr_in* ack_addr = malloc(sizeof(struct sockaddr_in));
   bzero((void*)ack_addr, sizeof(struct sockaddr_in));
   ack_addr->sin_family = AF_INET;
-  ack_addr->sin_port = htons(ACK_PORT);
+  if (ack_flag)
+    ack_addr->sin_port = htons(ACK_PORT2);
+  else {
+    ack_addr->sin_port = htons(ACK_PORT1);
+    ack_flag = 1;
+  }
   ack_addr->sin_addr.s_addr = inet_addr("127.0.0.1");
   
   meta->send_addr.sin_family = AF_INET;
@@ -169,17 +179,18 @@ int connect_rdt(char* hostname)
   pthread_mutex_unlock(&meta->buf_mutex);
 
   /* Dispatch maintainer thread */
-  if (!pipe_maintainer_thread) {
-    int* ack_socket = malloc(sizeof(int));
-    *ack_socket = meta->ack_socket;
-	pthread_mutex_init(&thread_mutex, 0);
-    pthread_create(&th, 0, pth_maintain_pipe, (void*)ack_socket);
-  }
+  int* ack_socket = malloc(sizeof(int));
+  *ack_socket = meta->ack_socket;
+  pthread_mutex_init(&thread_mutex, 0);
+  if (pipe_maintainer_thread)
+    pthread_cancel(pm_thread);
+  pipe_maintainer_thread = 1;
+  pthread_create(&pm_thread, 0, pth_maintain_pipe, (void*)ack_socket);
 
   return meta_i;
 }
 
-int init_serv(char* hostname)
+int init_serv(char* hostname, unsigned int PORT)
 {
   /* Local variables */
   int meta_i;
@@ -211,12 +222,13 @@ int init_serv(char* hostname)
   meta->buf_complete = LISTEN;
 
   /* Dispatch maintainer thread */
-  if (!pipe_maintainer_thread) {
-    int* udp_socket = malloc(sizeof(int));
-    *udp_socket = meta->udp_socket;
-    pthread_mutex_init(&thread_mutex, 0);
-    pthread_create(&th, 0, pth_maintain_pipe, (void*)udp_socket);
-  }
+  int* udp_socket = malloc(sizeof(int));
+  *udp_socket = meta->udp_socket;
+  pthread_mutex_init(&thread_mutex, 0);
+  if (pipe_maintainer_thread)
+    pthread_cancel(pm_thread);
+  pipe_maintainer_thread = 1;
+  pthread_create(&pm_thread, 0, pth_maintain_pipe, (void*)udp_socket);
 
   return meta_i;
 }
@@ -258,6 +270,9 @@ struct pth_sp_arg* make_pack_arg(int meta_i, int sequence, int length, int SEQ, 
 
 void* pth_send_packet(void* arg)
 {
+  struct sockaddr_in sockadd;
+  int sock_len = sizeof(sockadd);
+  // getsockname(udp_socket, (struct sockaddr*)&sockadd, &sock_len);
   pthread_detach(pthread_self());
   struct pth_sp_arg* packet_arg;
   connect_meta* meta;
@@ -271,11 +286,14 @@ void* pth_send_packet(void* arg)
     if (packet_arg->packet->header.ACK) {
       sendto(meta->ack_socket, packet_arg->packet, packet_arg->packet->header.length,
              0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
+      getsockname(meta->ack_socket, (struct sockaddr*)&sockadd, &sock_len);
 	}
     else {
       sendto(meta->udp_socket, packet_arg->packet, packet_arg->packet->header.length,
              0, (struct sockaddr*)&meta->send_addr, sizeof(struct sockaddr_in));
+      getsockname(meta->udp_socket, (struct sockaddr*)&sockadd, &sock_len);
 	}
+    printf("PORTNO: %d\n", ntohs(sockadd.sin_port));
     if (packet_sum) {
       packet_arg->packet->header.SENT = 1;
       add_to_sum(packet_arg->packet->header, meta->cwindow, meta->ssthresh);
@@ -294,6 +312,8 @@ void* pth_send_packet(void* arg)
       break;
     if (CON_CTRL) {
       meta->ssthresh = meta->cwindow / 2;
+      if (meta->ssthresh < PACK_LEN)
+        meta->ssthresh = PACK_LEN;
       meta->cwindow = INITIAL_CW;
     }
     printf("PACKET LOST FAGGOT--FRAME BASE: %d ACKED BMAP: %02x OFFSET: %d\n", meta->frame_base, meta->acked_bmap, packet_offset);
@@ -325,7 +345,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     /* Allocate meta_array */
     for (meta_i = 0; ; meta_i++) {
       if (meta_i == CONNECTION_LIMIT || (meta_array[meta_i] != NULL && (send_addr->sin_addr.s_addr == meta_array[meta_i]->send_addr.sin_addr.s_addr) &&
-	      (meta_array[meta_i]->buf_complete != LISTEN))) {
+	      (meta_array[meta_i]->buf_complete != LISTEN) && (meta_array[meta_i]->buf_complete != FIN_BUF))) {
         int sequence = packet->header.sequence_num + packet->header.length;
         pth_arg = make_pack_arg(meta_i, sequence, HEADER_LEN, 1, 0, 1);
         pthread_create(&thr, 0, pth_send_packet, pth_arg);
@@ -353,7 +373,12 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
     meta_array[meta_i]->ack_socket = socket(AF_INET, SOCK_DGRAM, 0);
     meta_array[meta_i]->send_addr.sin_family = AF_INET;
     meta_array[meta_i]->send_addr.sin_addr.s_addr = send_addr->sin_addr.s_addr;
-    meta_array[meta_i]->send_addr.sin_port = htons(ACK_PORT); //we're gonna respond on a different port
+    if (ack_flag)
+      meta_array[meta_i]->send_addr.sin_port = htons(ACK_PORT2); //we're gonna respond on a different port
+    else {
+      meta_array[meta_i]->send_addr.sin_port = htons(ACK_PORT1); //we're gonna respond on a different port
+      ack_flag = 1;
+    }
     meta_array[meta_i]->frame_base = packet->header.sequence_num + packet->header.length;
     meta_array[meta_i]->acked_bmap = 0;
     meta_array[meta_i]->cwindow = WIN_SIZE;
@@ -380,7 +405,7 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
   for (meta_i = 0; meta_i < CONNECTION_LIMIT; meta_i++) {
     if (meta_array[meta_i] != NULL) {
       if ((send_addr->sin_addr.s_addr == meta_array[meta_i]->send_addr.sin_addr.s_addr) &&
-	      (meta_array[meta_i]->buf_complete != LISTEN))
+	      (meta_array[meta_i]->buf_complete != LISTEN && meta_array[meta_i]->buf_complete != FIN_BUF))
 		break;
     }
   }
@@ -838,4 +863,19 @@ void check_missed_acks(int meta_i)
       }
     }
   }
+}
+
+char* get_host_name(int meta_i)
+{
+  connect_meta* meta = meta_array[meta_i];
+  char* buf = malloc(32*sizeof(char));
+  getnameinfo((struct sockaddr*)&meta->send_addr, sizeof(meta->send_addr), buf, 32, NULL, 0, 0);
+  return buf;
+}
+
+void remove_connect(int meta_i)
+{
+  connect_meta* meta = meta_array[meta_i];
+  meta_array[meta_i] = NULL;
+  free(meta);
 }
