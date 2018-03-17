@@ -442,6 +442,8 @@ void route_packet(h_packet* packet, struct sockaddr_in* send_addr, int sock_fd)
 		break;
     }
   }
+  if (meta_i == CONNECTION_LIMIT)
+    return;
   connect_meta* meta = meta_array[meta_i];
   //print_meta_data(meta, meta_i); //DEBUG
 
